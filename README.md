@@ -125,7 +125,15 @@ Host-mode only. Each workflow step runs as a shell subprocess:
 | `work_dir` | `/tmp/fucina` | Working directory for jobs |
 | `runner_file` | `.runner` | Path to credentials file |
 
-## LaunchAgent Setup (macOS)
+## macOS Setup — use a LaunchDaemon, not a LaunchAgent
+
+**Important**: on macOS Sequoia (15) and Tahoe (26), LaunchAgents are subject to Local Network Privacy. Non-Apple-signed binaries calling `connect()` to RFC1918 addresses (your LAN Gitea) silently get `EHOSTUNREACH` with no TCC prompt in headless context. Per Apple's DTS engineer ([forum thread](https://developer.apple.com/forums/thread/763753)): **daemons running as root are exempt; agents are subject**.
+
+`UserName` on a LaunchDaemon to run as a non-root user is explicitly an **unsupported mixed context** and has the same problem.
+
+### The working setup: LaunchDaemon as root
+
+`/Library/LaunchDaemons/net.calii.fucina.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -133,33 +141,48 @@ Host-mode only. Each workflow step runs as a shell subprocess:
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>net.calii.fucina</string>
+    <key>Label</key><string>net.calii.fucina</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/fucina</string>
-        <string>-c</string>
+        <string>--config</string>
         <string>/etc/fucina/config.yaml</string>
         <string>daemon</string>
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/var/log/fucina.log</string>
-    <key>StandardErrorPath</key>
-    <string>/var/log/fucina.log</string>
+    <key>WorkingDirectory</key><string>/var/lib/fucina</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/var/log/fucina.log</string>
+    <key>StandardErrorPath</key><string>/var/log/fucina.log</string>
 </dict>
 </plist>
 ```
 
+Install:
+
 ```bash
-cp net.calii.fucina.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/net.calii.fucina.plist
+sudo cp net.calii.fucina.plist /Library/LaunchDaemons/
+sudo chown root:wheel /Library/LaunchDaemons/net.calii.fucina.plist
+sudo chmod 644 /Library/LaunchDaemons/net.calii.fucina.plist
+sudo launchctl bootstrap system /Library/LaunchDaemons/net.calii.fucina.plist
 ```
 
-On macOS **Tahoe (26)** the signing + entitlement dance is no longer strictly necessary — LaunchAgents can access local network cleanly. On Sequoia you still need the signed binary with entitlements.
+### LaunchAgent workaround (only if root daemon is not an option)
+
+If you *must* run per-user in a logged-in GUI session, wrap fucina via osascript→Terminal.app. Terminal inherits the user session's implicit local-network grant. Ugly but works:
+
+```bash
+#!/bin/zsh
+# ~/gitea-runner-rs/run.sh
+osascript -e '
+tell application "Terminal"
+    do script "cd ~/gitea-runner-rs && exec ./fucina --config config.yaml daemon 2>&1 | tee runner.log"
+    delay 2
+    set miniaturized of front window to true
+end tell'
+```
+
+LaunchAgent plist points `ProgramArguments` to `run.sh`.
 
 ## Debugging
 
