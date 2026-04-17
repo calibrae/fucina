@@ -4,14 +4,23 @@
 
 A lean replacement for the official `act_runner` (Go), built to survive macOS quirks and ship as a single static binary. Currently running in production on Gitea at [git.calii.net](https://git.calii.net), executing real CI jobs on macOS ARM64.
 
+> ### ⚠️ macOS deployment gotcha (Sequoia 15 + Tahoe 26)
+>
+> macOS **Local Network Privacy** silently blocks third-party binaries running as LaunchAgents from connecting to RFC1918 addresses (your LAN Gitea) — you get `EHOSTUNREACH` with no TCC prompt. `curl` works because it's Apple-signed; signing with your own Developer ID is **not** enough.
+>
+> **The fix, per Apple's DTS engineer:** run fucina as a **LaunchDaemon as root**. Daemons in the global login session are exempt from Local Network Privacy; user-session agents are not. Using `UserName` on a LaunchDaemon to run as a non-root user is an **unsupported mixed context** and fails the same way.
+>
+> See [macOS Setup](#macos-setup--use-a-launchdaemon-not-a-launchagent) below for the working plist.
+
 ## Why
 
-The official `act_runner` (Go) fails to access local network when launched from macOS LaunchAgents on Sequoia. macOS blocks unsigned/ad-hoc binaries from making local network connections in non-interactive contexts. The GitHub Actions runner dodges this because Node.js is Apple-signed — Go binaries aren't.
+The official `act_runner` (Go) fails to access local network when launched from macOS LaunchAgents. This turned out to be macOS's Local Network Privacy feature, not the Go runtime's fault — but the Go runner had other quirks on macOS anyway.
 
-*fucina* solves this by:
-- Signing properly with a Developer ID + network entitlements
+*fucina* fixes the deployment story by:
 - Shipping as a single static binary with no runtime dependencies
+- Signing with a Developer ID + `com.apple.security.network.client` entitlement (necessary even if not sufficient on its own)
 - Running workflow steps directly on the host (no Docker)
+- Documenting the LaunchDaemon-as-root requirement so you don't waste a day rediscovering it
 - Being small enough to understand and fix when something breaks
 
 ## Quick Start
