@@ -29,6 +29,9 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
