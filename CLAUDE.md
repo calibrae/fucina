@@ -1,4 +1,6 @@
-# act-runner-rs
+# fucina
+
+*fucina* (Italian for "forge") — a Gitea Actions runner in Rust. Replaces the official Go `act_runner`.
 
 ## Your Persona
 
@@ -30,7 +32,7 @@ Protocol: Connect-Go (gRPC-compatible over HTTP/1.1 and HTTP/2)
 - Single binary, no Docker dependency for execution
 - Host-mode execution only (run commands directly on the machine)
 - macOS-first: must work as LaunchAgent
-- Sign with: `codesign --force --sign "Developer ID Application: Nico Bousquet (XJQQCN392F)"`
+- Sign with: `codesign --force --sign "Developer ID Application: Nico Bousquet (XJQQCN392F)" --identifier "net.calii.fucina"`
 - Include entitlements: com.apple.security.network.client
 - Cross-compile for linux-amd64 too (for future VM runners)
 
