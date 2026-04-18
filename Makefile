@@ -7,8 +7,9 @@ NOTARY_PROFILE = FUCINA_NOTARY
 ENTITLEMENTS = entitlements.plist
 PKG_ROOT = target/pkg-root
 PKG = target/$(BINARY)-$(VERSION).pkg
+APP_BUNDLE = target/Fucina.app
 
-.PHONY: build release sign notarize pkg pkg-sign pkg-notarize pkg-staple dist clean
+.PHONY: build release sign bundle notarize pkg pkg-sign pkg-notarize pkg-staple dist clean
 
 build:
 	cargo build
@@ -24,17 +25,40 @@ sign: release
 		target/release/$(BINARY)
 	codesign -dvvv target/release/$(BINARY)
 
+# Build Fucina.app bundle wrapping the CLI binary.
+# The bundle is what LaunchServices registers; the embedded Info.plist
+# (with NSLocalNetworkUsageDescription) is what TCC keys Local Network
+# grants against on SIP-enabled macOS.
+bundle: release
+	rm -rf $(APP_BUNDLE)
+	mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	cp target/release/$(BINARY) $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
+	chmod 755 $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
+	sed "s/__VERSION__/$(VERSION)/g" bundle/Info.plist.template > $(APP_BUNDLE)/Contents/Info.plist
+	codesign --force --options runtime --timestamp \
+		--sign "$(APP_SIGN)" \
+		--identifier "$(IDENTIFIER)" \
+		--entitlements $(ENTITLEMENTS) \
+		$(APP_BUNDLE)/Contents/MacOS/$(BINARY)
+	codesign --force --options runtime --timestamp \
+		--sign "$(APP_SIGN)" \
+		--identifier "$(IDENTIFIER)" \
+		--entitlements $(ENTITLEMENTS) \
+		$(APP_BUNDLE)
+	codesign -dvvv $(APP_BUNDLE)
+
 notarize: sign
 	cd target/release && zip -q $(BINARY).zip $(BINARY)
 	xcrun notarytool submit target/release/$(BINARY).zip \
 		--keychain-profile $(NOTARY_PROFILE) --wait
 
-# Build signed + notarized + stapled .pkg for distribution on SIP-enabled hosts
-pkg: sign
+# Build signed + notarized + stapled .pkg that installs Fucina.app to /Applications
+# plus a /usr/local/bin/fucina symlink.
+pkg: bundle
 	rm -rf $(PKG_ROOT)
-	mkdir -p $(PKG_ROOT)/usr/local/bin
-	cp target/release/$(BINARY) $(PKG_ROOT)/usr/local/bin/$(BINARY)
-	chmod 755 $(PKG_ROOT)/usr/local/bin/$(BINARY)
+	mkdir -p $(PKG_ROOT)/Applications $(PKG_ROOT)/usr/local/bin
+	cp -R $(APP_BUNDLE) $(PKG_ROOT)/Applications/Fucina.app
+	ln -sf /Applications/Fucina.app/Contents/MacOS/$(BINARY) $(PKG_ROOT)/usr/local/bin/$(BINARY)
 	pkgbuild --root $(PKG_ROOT) \
 		--identifier $(IDENTIFIER) \
 		--version $(VERSION) \
@@ -55,4 +79,4 @@ linux:
 
 clean:
 	cargo clean
-	rm -rf $(PKG_ROOT) target/*.pkg target/release/$(BINARY).zip
+	rm -rf $(PKG_ROOT) $(APP_BUNDLE) target/*.pkg target/release/$(BINARY).zip

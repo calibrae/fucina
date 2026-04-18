@@ -5,6 +5,9 @@ mod proto;
 mod reporter;
 mod runner;
 
+#[cfg(target_os = "macos")]
+mod macos_menu;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -40,8 +43,7 @@ enum Commands {
     Daemon,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -55,12 +57,29 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
 
     match cli.command {
-        Commands::Register {
-            token,
-            name,
-            labels,
-        } => cmd_register(&config, &token, name.as_deref(), labels.as_deref()).await,
-        Commands::Daemon => cmd_daemon(&config).await,
+        Commands::Register { token, name, labels } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd_register(
+                &config,
+                &token,
+                name.as_deref(),
+                labels.as_deref(),
+            ))
+        }
+        Commands::Daemon => {
+            // macOS: main thread must host NSApplication for LaunchServices
+            // registration + Local Network Privacy prompts. The tokio runtime
+            // and poller run on a worker thread inside macos_menu::run.
+            #[cfg(target_os = "macos")]
+            {
+                macos_menu::run(config)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(cmd_daemon(&config))
+            }
+        }
     }
 }
 
@@ -96,7 +115,34 @@ async fn cmd_register(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 async fn cmd_daemon(config: &config::Config) -> Result<()> {
+    // When running inside the macOS menu-bar host, shutdown signals come
+    // from NSApplication::terminate via the worker thread. Otherwise set
+    // up SIGINT/SIGTERM handlers ourselves.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("failed to register SIGINT");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM");
+        tokio::select! {
+            _ = sigint.recv() => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
+        }
+        let _ = tx.send(true);
+    });
+
+    run_daemon(config.clone(), shutdown_rx).await
+}
+
+/// Core daemon loop without signal-handling wiring — used both by the plain
+/// CLI path and by the macOS menu-bar host (which drives shutdown via NSApp).
+pub async fn run_daemon(
+    config: config::Config,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let creds = config::Credentials::load(&config.runner_file).with_context(|| {
         format!(
             "no runner credentials at {} — run 'register' first",
@@ -113,38 +159,21 @@ async fn cmd_daemon(config: &config::Config) -> Result<()> {
         client::ConnectClient::new(&config.api_base())?.with_credentials(creds.uuid, creds.token),
     );
 
-    // Declare capabilities
     let runner = client.declare(&config.labels).await?;
     info!("declared: id={} labels={:?}", runner.id, runner.labels);
 
-    // Create work directory
     tokio::fs::create_dir_all(&config.work_dir).await?;
 
-    // Shutdown signal
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-
-    // Handle SIGINT/SIGTERM
-    let tx = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .expect("failed to register SIGINT");
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM");
-
-        tokio::select! {
-            _ = sigint.recv() => info!("received SIGINT"),
-            _ = sigterm.recv() => info!("received SIGTERM"),
-        }
-        let _ = tx.send(true);
-    });
-
-    // Run poller
     let mut poller = poller::Poller::new(
         client,
         config.capacity,
         config.fetch_interval,
         config.work_dir.clone(),
+        config.run_as.clone(),
     );
+    if let Some(user) = &config.run_as {
+        info!("workflow steps will run as user '{}' via sudo", user);
+    }
 
     if let Err(e) = poller.run(shutdown_rx).await {
         error!("poller error: {:#}", e);

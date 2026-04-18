@@ -27,6 +27,11 @@ pub struct Config {
     /// Path to .runner credentials file
     #[serde(default = "default_runner_file")]
     pub runner_file: PathBuf,
+    /// When set, workflow step commands are spawned as this user via `sudo -u`.
+    /// Use to run as an unprivileged user when fucina itself runs as root
+    /// (required on macOS for LAN access via Local Network Privacy exemption).
+    #[serde(default)]
+    pub run_as: Option<String>,
 }
 
 fn default_name() -> String {

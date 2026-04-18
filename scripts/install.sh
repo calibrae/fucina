@@ -55,7 +55,9 @@ EOF
 
 echo "==> registering runner"
 cd "$RUNNER_HOME"
-/usr/local/bin/fucina --config config.yaml register --token "$TOKEN"
+FUCINA_BIN=/Applications/Fucina.app/Contents/MacOS/fucina
+[ -x "$FUCINA_BIN" ] || FUCINA_BIN=/usr/local/bin/fucina
+"$FUCINA_BIN" --config config.yaml register --token "$TOKEN"
 
 echo "==> writing LaunchAgent plist $PLIST"
 mkdir -p "$(dirname "$PLIST")"
@@ -67,7 +69,7 @@ cat > "$PLIST" <<EOF
     <key>Label</key><string>$LABEL</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/fucina</string>
+        <string>$FUCINA_BIN</string>
         <string>--config</string><string>$RUNNER_HOME/config.yaml</string>
         <string>daemon</string>
     </array>

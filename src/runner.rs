@@ -28,6 +28,7 @@ pub async fn execute(
     task: &Task,
     reporter: Arc<Reporter>,
     work_dir: &Path,
+    run_as: Option<&str>,
 ) -> Result<proto::TaskResult> {
     // Decode workflow payload (base64-encoded YAML)
     let yaml_bytes = base64::engine::general_purpose::STANDARD
@@ -62,6 +63,17 @@ pub async fn execute(
     tokio::fs::create_dir_all(&job_dir)
         .await
         .context("failed to create job directory")?;
+
+    // If steps will run as a different user, hand ownership of the job dir
+    // so that user can create target/, caches, etc.
+    if let Some(user) = run_as {
+        let _ = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{}:staff", user))
+            .arg(&job_dir)
+            .status()
+            .await;
+    }
 
     // Build environment variables from task context
     let env_vars = build_env(task);
@@ -114,6 +126,7 @@ pub async fn execute(
                 &env_vars,
                 &task.secrets,
                 &task.vars,
+                run_as,
                 &reporter,
             )
             .await
@@ -180,16 +193,15 @@ pub async fn execute(
 }
 
 fn extract_job_id(context: &serde_json::Value) -> Option<String> {
-    // The context might have job info at different paths
+    // Gitea sends github context flat at root; some impls nest under "github"
     context
-        .get("github")
-        .and_then(|g| g.get("job"))
+        .get("job")
         .and_then(|j| j.as_str())
         .map(|s| s.to_string())
         .or_else(|| {
-            // Flat context (Gitea might put job directly)
             context
-                .get("job")
+                .get("github")
+                .and_then(|g| g.get("job"))
                 .and_then(|j| j.as_str())
                 .map(|s| s.to_string())
         })
@@ -278,14 +290,20 @@ fn build_env(task: &Task) -> HashMap<String, String> {
     env.insert("GITEA_ACTIONS".to_string(), "true".to_string());
     env.insert("GITHUB_ACTIONS".to_string(), "true".to_string());
 
-    // Extract vars from context
-    if let Some(github) = task.context.get("github") {
-        if let Some(obj) = github.as_object() {
-            for (k, v) in obj {
-                if let Some(s) = v.as_str() {
-                    let key = format!("GITHUB_{}", k.to_uppercase());
-                    env.insert(key, s.to_string());
-                }
+    // Extract vars from context. Gitea sends the github context as a flat object
+    // at the root of `context` (github.ref → context.ref), but some implementations
+    // may nest under a `github` key — handle both.
+    let github_ctx = task
+        .context
+        .get("github")
+        .and_then(|v| v.as_object())
+        .or_else(|| task.context.as_object());
+
+    if let Some(obj) = github_ctx {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                let key = format!("GITHUB_{}", k.to_uppercase());
+                env.insert(key, s.to_string());
             }
         }
     }
@@ -298,6 +316,7 @@ fn build_env(task: &Task) -> HashMap<String, String> {
     env
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_run_step(
     run_cmd: &str,
     step: &Step,
@@ -305,6 +324,7 @@ async fn execute_run_step(
     env_vars: &HashMap<String, String>,
     secrets: &HashMap<String, String>,
     vars: &HashMap<String, String>,
+    run_as: Option<&str>,
     reporter: &Reporter,
 ) -> Result<proto::TaskResult> {
     let shell = step.shell.as_deref().unwrap_or("bash");
@@ -322,19 +342,51 @@ async fn execute_run_step(
         .unwrap_or_else(|| job_dir.to_path_buf());
 
     tokio::fs::create_dir_all(&work).await?;
+    if let Some(user) = run_as {
+        let _ = Command::new("chown")
+            .arg(format!("{}:staff", user))
+            .arg(&work)
+            .status()
+            .await;
+    }
 
     reporter
         .logf(format!("$ {}", run_cmd.lines().next().unwrap_or("")))
         .await;
 
-    let mut cmd = Command::new(shell_bin);
-    cmd.args(&shell_args)
-        .arg(run_cmd)
-        .current_dir(&work)
+    // Build the command, wrapping in `sudo -u <user> -H -E` when run_as is set.
+    // -H sets HOME to target user's home; -E preserves the parent env (PATH, etc.).
+    let mut cmd = match run_as {
+        Some(user) => {
+            let mut c = Command::new("sudo");
+            c.args(["-u", user, "-H", "-E", "--", shell_bin]);
+            c.args(&shell_args);
+            c.arg(run_cmd);
+            c
+        }
+        None => {
+            let mut c = Command::new(shell_bin);
+            c.args(&shell_args);
+            c.arg(run_cmd);
+            c
+        }
+    };
+    cmd.current_dir(&work)
         .envs(env_vars)
         .envs(&step.env)
         .envs(secrets)
         .envs(vars);
+
+    // When running as a different user, strip daemon-context env vars that
+    // point at root-owned paths. sudo -H sets HOME to the target user's home;
+    // cargo/rustup then default to $HOME/.cargo and $HOME/.rustup respectively.
+    if run_as.is_some() {
+        for key in ["HOME", "CARGO_HOME", "RUSTUP_HOME", "USER", "LOGNAME"] {
+            if !step.env.contains_key(key) {
+                cmd.env_remove(key);
+            }
+        }
+    }
 
     let output = cmd.output().await.context("failed to execute command")?;
 

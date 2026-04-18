@@ -13,6 +13,7 @@ pub struct Poller {
     capacity: Arc<Semaphore>,
     fetch_interval: std::time::Duration,
     work_dir: PathBuf,
+    run_as: Option<String>,
     tasks_version: i64,
 }
 
@@ -22,12 +23,14 @@ impl Poller {
         capacity: usize,
         fetch_interval_secs: u64,
         work_dir: PathBuf,
+        run_as: Option<String>,
     ) -> Self {
         Self {
             client,
             capacity: Arc::new(Semaphore::new(capacity)),
             fetch_interval: std::time::Duration::from_secs(fetch_interval_secs),
             work_dir,
+            run_as,
             tasks_version: 0,
         }
     }
@@ -102,10 +105,11 @@ impl Poller {
 
         let client = self.client.clone();
         let work_dir = self.work_dir.clone();
+        let run_as = self.run_as.clone();
 
         tokio::spawn(async move {
             let reporter = Arc::new(Reporter::new(client, task.id));
-            match runner::execute(&task, reporter, &work_dir).await {
+            match runner::execute(&task, reporter, &work_dir, run_as.as_deref()).await {
                 Ok(result) => {
                     info!("task {} completed: {:?}", task.id, result);
                 }
