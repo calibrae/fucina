@@ -18,6 +18,9 @@ fn main() {
 <key>CFBundleShortVersionString</key><string>{v}</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
+<key>NSPrincipalClass</key><string>NSApplication</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.developer-tools</string>
+<key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
 <key>NSLocalNetworkUsageDescription</key><string>Fucina connects to your Gitea server on the local network to poll for CI jobs.</string>
 <key>NSBonjourServices</key><array><string>_http._tcp</string><string>_https._tcp</string></array>
 </dict></plist>"#,
