@@ -71,9 +71,82 @@ jobs:
             dist/${{ steps.package.outputs.checksum }}
           retention-days: 7
 
+  pkg:
+    name: macOS .pkg (signed + notarized + stapled)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pkg-arm64
+
+      - name: Install toolchain targets
+        run: |
+          rustup target add aarch64-apple-darwin
+          rustup target add x86_64-apple-darwin
+
+      - name: Build universal binary
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/fucina \
+            target/aarch64-apple-darwin/release/fucina \
+            target/x86_64-apple-darwin/release/fucina
+          lipo -info target/release/fucina
+
+      - name: Import signing certificates
+        env:
+          APPLE_DEVID_APPLICATION_P12: ${{ secrets.APPLE_DEVID_APPLICATION_P12 }}
+          APPLE_DEVID_APPLICATION_PASSWORD: ${{ secrets.APPLE_DEVID_APPLICATION_PASSWORD }}
+          APPLE_DEVID_INSTALLER_P12: ${{ secrets.APPLE_DEVID_INSTALLER_P12 }}
+          APPLE_DEVID_INSTALLER_PASSWORD: ${{ secrets.APPLE_DEVID_INSTALLER_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/fucina.keychain-db"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          OLD_KEYCHAINS=$(security list-keychains -d user | sed 's/"//g')
+          security list-keychains -d user -s "$KEYCHAIN" $OLD_KEYCHAINS
+          echo "$APPLE_DEVID_APPLICATION_P12" | base64 -d > "$RUNNER_TEMP/app.p12"
+          echo "$APPLE_DEVID_INSTALLER_P12"   | base64 -d > "$RUNNER_TEMP/inst.p12"
+          security import "$RUNNER_TEMP/app.p12"  -k "$KEYCHAIN" -P "$APPLE_DEVID_APPLICATION_PASSWORD" -A
+          security import "$RUNNER_TEMP/inst.p12" -k "$KEYCHAIN" -P "$APPLE_DEVID_INSTALLER_PASSWORD"   -A
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,pkgbuild:,productbuild: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
+          rm "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Store notarytool credentials
+        env:
+          APPLE_ID_EMAIL: ${{ secrets.APPLE_ID_EMAIL }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials FUCINA_NOTARY \
+            --apple-id "$APPLE_ID_EMAIL" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+
+      - name: Build + sign + notarize + staple pkg
+        run: |
+          # Makefile's `pkg` target depends on `release` which re-runs cargo;
+          # skip it since we already built the universal binary.
+          touch target/release/fucina
+          make pkg
+
+      - name: Upload pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-pkg
+          path: |
+            target/fucina-*.pkg
+          retention-days: 7
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, pkg]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -98,3 +171,4 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/*.pkg
