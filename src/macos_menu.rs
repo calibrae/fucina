@@ -140,34 +140,29 @@ fn set_login_item(path_or_name: &str, enabled: bool) {
         .output();
 }
 
-/// On macOS, BSD-socket `connect()` to RFC1918 addresses does not fire the
-/// Local Network Privacy prompt reliably. Bonjour browsing does. We spawn
-/// the Apple-signed `dns-sd` tool for ~2 seconds; since fucina is the
-/// responsible process ancestor, the Local Network grant gets attributed
-/// to Fucina.app's bundle ID. Subsequent BSD-socket connects inherit.
-fn trigger_local_network_prompt() {
-    use std::process::{Command, Stdio};
-    use std::time::Duration;
+/// Start an in-process `NSNetServiceBrowser` to surface the Local Network
+/// Privacy prompt, attributed to Fucina.app's bundle identifier. Runs on
+/// the NSApp main runloop for the life of the process — cheap, keeps the
+/// grant "live".
+fn trigger_local_network_prompt(
+    mtm: MainThreadMarker,
+) -> Option<Retained<objc2::runtime::AnyObject>> {
+    use objc2::runtime::AnyClass;
 
-    let mut child = match Command::new("/usr/bin/dns-sd")
-        .args(["-B", "_http._tcp", "local."])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            error!("failed to spawn dns-sd for LAN prompt trigger: {e}");
-            return;
-        }
-    };
-    info!(
-        "spawned dns-sd Bonjour browse (pid {}) to surface Local Network prompt",
-        child.id()
-    );
-    std::thread::sleep(Duration::from_secs(2));
-    let _ = child.kill();
-    let _ = child.wait();
+    let browser_cls = AnyClass::get("NSNetServiceBrowser")?;
+    let browser: Retained<objc2::runtime::AnyObject> = unsafe { msg_send_id![browser_cls, new] };
+    let service_type = NSString::from_str("_http._tcp.");
+    let domain = NSString::from_str("local.");
+    unsafe {
+        let _: () = msg_send![
+            &browser,
+            searchForServicesOfType: &*service_type,
+            inDomain: &*domain
+        ];
+    }
+    let _ = mtm; // NSNetServiceBrowser uses the main runloop which NSApp will start
+    info!("NSNetServiceBrowser searching _http._tcp to surface Local Network prompt");
+    Some(browser)
 }
 
 pub fn run(config: Config) -> Result<()> {
@@ -175,7 +170,7 @@ pub fn run(config: Config) -> Result<()> {
 
     // Fire a Bonjour browse so macOS surfaces the Local Network permission
     // prompt attributed to this bundle (BSD-socket connects don't trigger it).
-    trigger_local_network_prompt();
+    let _ln_browser = trigger_local_network_prompt(mtm);
 
     // Daemon on worker thread
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
