@@ -1,6 +1,6 @@
 [package]
 name = "fucina"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Gitea Actions runner in Rust"
 license = "MIT"
