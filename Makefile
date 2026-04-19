@@ -1,5 +1,9 @@
 BINARY = fucina
-IDENTIFIER = net.calii.fucina
+# Bumped from net.calii.fucina → net.calii.fucina.app so macOS sees a fresh
+# bundle identity and reopens the Local Network Privacy decision path (Apple
+# docs: grants can't be reset for an existing bundle ID).
+IDENTIFIER = net.calii.fucina.app
+PKG_IDENTIFIER = net.calii.fucina
 VERSION = $(shell grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
 APP_SIGN = Developer ID Application: Nico Bousquet (XJQQCN392F)
 PKG_SIGN = Developer ID Installer: Nico Bousquet (XJQQCN392F)
@@ -61,7 +65,7 @@ pkg: bundle
 	cp -R $(APP_BUNDLE) $(PKG_ROOT)/Applications/Fucina.app
 	ln -sf /Applications/Fucina.app/Contents/MacOS/$(BINARY) $(PKG_ROOT)/usr/local/bin/$(BINARY)
 	pkgbuild --root $(PKG_ROOT) \
-		--identifier $(IDENTIFIER) \
+		--identifier $(PKG_IDENTIFIER) \
 		--version $(VERSION) \
 		--install-location / \
 		--scripts bundle/scripts \

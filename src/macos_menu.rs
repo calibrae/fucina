@@ -140,15 +140,29 @@ fn set_login_item(path_or_name: &str, enabled: bool) {
         .output();
 }
 
-/// Start an in-process `NSNetServiceBrowser` to surface the Local Network
-/// Privacy prompt, attributed to Fucina.app's bundle identifier. Runs on
-/// the NSApp main runloop for the life of the process — cheap, keeps the
-/// grant "live".
+/// Surface the Local Network Privacy prompt using two documented triggers:
+/// 1. `[[NSProcessInfo processInfo] hostName]` — unexpectedly but reliably
+///    fires the prompt per Apple DTS Quinn on the developer forums.
+/// 2. An `NSNetServiceBrowser` kept alive for the life of the app to hold
+///    the grant "live".
 fn trigger_local_network_prompt(
     mtm: MainThreadMarker,
 ) -> Option<Retained<objc2::runtime::AnyObject>> {
     use objc2::runtime::AnyClass;
 
+    // (1) hostName — cheap, known prompt trigger
+    let proc_cls = AnyClass::get("NSProcessInfo")?;
+    unsafe {
+        let pi: *mut objc2::runtime::AnyObject = msg_send![proc_cls, processInfo];
+        if !pi.is_null() {
+            let hn: *mut objc2::runtime::AnyObject = msg_send![pi, hostName];
+            if !hn.is_null() {
+                info!("touched NSProcessInfo.hostName to trigger Local Network prompt");
+            }
+        }
+    }
+
+    // (2) Bonjour browse — keep it alive as an ongoing LN activity
     let browser_cls = AnyClass::get("NSNetServiceBrowser")?;
     let browser: Retained<objc2::runtime::AnyObject> = unsafe { msg_send_id![browser_cls, new] };
     let service_type = NSString::from_str("_http._tcp.");
@@ -160,8 +174,8 @@ fn trigger_local_network_prompt(
             inDomain: &*domain
         ];
     }
-    let _ = mtm; // NSNetServiceBrowser uses the main runloop which NSApp will start
-    info!("NSNetServiceBrowser searching _http._tcp to surface Local Network prompt");
+    let _ = mtm;
+    info!("NSNetServiceBrowser searching _http._tcp");
     Some(browser)
 }
 
@@ -172,10 +186,14 @@ pub fn run(config: Config) -> Result<()> {
     // prompt attributed to this bundle (BSD-socket connects don't trigger it).
     let _ln_browser = trigger_local_network_prompt(mtm);
 
-    // Daemon on worker thread
+    // Daemon on worker thread. Wait a few seconds before touching the
+    // network so NSApp has time to register with LaunchServices and any
+    // Local Network Privacy prompt has a chance to surface on a stable
+    // bundle identity.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let worker_cfg = config.clone();
     let worker = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {

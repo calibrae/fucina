@@ -11,7 +11,7 @@ fn main() {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>net.calii.fucina</string>
+<key>CFBundleIdentifier</key><string>net.calii.fucina.app</string>
 <key>CFBundleName</key><string>fucina</string>
 <key>CFBundleExecutable</key><string>fucina</string>
 <key>CFBundleVersion</key><string>{v}</string>

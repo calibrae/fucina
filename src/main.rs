@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "fucina", about = "Gitea Actions runner (Rust)")]
@@ -204,7 +204,7 @@ async fn cmd_daemon(config: &config::Config) -> Result<()> {
 /// CLI path and by the macOS menu-bar host (which drives shutdown via NSApp).
 pub async fn run_daemon(
     config: config::Config,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let creds = config::Credentials::load(&config.runner_file).with_context(|| {
         format!(
@@ -219,10 +219,30 @@ pub async fn run_daemon(
     );
 
     let client = Arc::new(
-        client::ConnectClient::new(&config.api_base())?.with_credentials(creds.uuid, creds.token),
+        client::ConnectClient::new(&config.api_base())?
+            .with_credentials(creds.uuid.clone(), creds.token.clone()),
     );
 
-    let runner = client.declare(&config.labels).await?;
+    // Retry Declare until it succeeds or we're told to shut down. On macOS
+    // this also gives Local Network Privacy time to surface its prompt —
+    // short-lived processes get silently denied.
+    let runner = loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+        match client.declare(&config.labels).await {
+            Ok(r) => break r,
+            Err(e) => {
+                warn!("declare failed: {:#} — retrying in 10s", e);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() { return Ok(()); }
+                    }
+                }
+            }
+        }
+    };
     info!("declared: id={} labels={:?}", runner.id, runner.labels);
 
     tokio::fs::create_dir_all(&config.work_dir).await?;

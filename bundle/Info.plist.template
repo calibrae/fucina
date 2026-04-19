@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>net.calii.fucina</string>
+    <string>net.calii.fucina.app</string>
     <key>CFBundleName</key>
     <string>fucina</string>
     <key>CFBundleDisplayName</key>
