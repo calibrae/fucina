@@ -10,6 +10,8 @@
     <string>Fucina</string>
     <key>CFBundleExecutable</key>
     <string>fucina</string>
+    <key>CFBundleIconFile</key>
+    <string>Fucina</string>
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
     <key>CFBundleShortVersionString</key>

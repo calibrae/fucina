@@ -17,12 +17,15 @@ use tracing::{error, info};
 #[derive(Parser)]
 #[command(name = "fucina", about = "Gitea Actions runner (Rust)")]
 struct Cli {
-    /// Path to config file
-    #[arg(short, long, default_value = "config.yaml")]
-    config: PathBuf,
+    /// Path to config file. When not given, defaults to
+    /// `~/gitea-runner-rs/config.yaml` so the `.app` bundle can be
+    /// double-clicked from Finder without args.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
+    /// Subcommand. When omitted, defaults to `daemon` (Finder double-click UX).
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +46,16 @@ enum Commands {
     Daemon,
 }
 
+fn default_config_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        let p = PathBuf::from(home).join("gitea-runner-rs/config.yaml");
+        if p.exists() {
+            return p;
+        }
+    }
+    PathBuf::from("config.yaml")
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -51,12 +64,21 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    // Finder/LaunchServices may pass a -psn_X_Y process-serial-number arg
+    // when launching .app bundles. Strip it before clap sees argv.
+    let args: Vec<String> = std::env::args()
+        .filter(|a| !a.starts_with("-psn_"))
+        .collect();
+    let cli = Cli::parse_from(args);
 
-    let config = config::Config::load(&cli.config)
-        .with_context(|| format!("loading config from {}", cli.config.display()))?;
+    let config_path = cli.config.unwrap_or_else(default_config_path);
+    let config = config::Config::load(&config_path)
+        .with_context(|| format!("loading config from {}", config_path.display()))?;
 
-    match cli.command {
+    // Default to daemon if no subcommand (Finder double-click launch).
+    let command = cli.command.unwrap_or(Commands::Daemon);
+
+    match command {
         Commands::Register {
             token,
             name,

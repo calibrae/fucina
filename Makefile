@@ -31,9 +31,10 @@ sign: release
 # grants against on SIP-enabled macOS.
 bundle: release
 	rm -rf $(APP_BUNDLE)
-	mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	mkdir -p $(APP_BUNDLE)/Contents/MacOS $(APP_BUNDLE)/Contents/Resources
 	cp target/release/$(BINARY) $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
 	chmod 755 $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
+	cp bundle/Fucina.icns $(APP_BUNDLE)/Contents/Resources/Fucina.icns
 	sed "s/__VERSION__/$(VERSION)/g" bundle/Info.plist.template > $(APP_BUNDLE)/Contents/Info.plist
 	codesign --force --options runtime --timestamp \
 		--sign "$(APP_SIGN)" \
