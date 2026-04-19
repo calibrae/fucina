@@ -6,3 +6,4 @@ config.yaml
 config.yml
 *.log
 .DS_Store
+.claude/
