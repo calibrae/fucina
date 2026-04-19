@@ -29,6 +29,9 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>Fucina connects to your Gitea server on the local network to poll for CI jobs.</string>
     <key>NSBonjourServices</key>
-    <array/>
+    <array>
+        <string>_http._tcp</string>
+        <string>_https._tcp</string>
+    </array>
 </dict>
 </plist>

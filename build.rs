@@ -19,6 +19,7 @@ fn main() {
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Fucina connects to your Gitea server on the local network to poll for CI jobs.</string>
+<key>NSBonjourServices</key><array><string>_http._tcp</string><string>_https._tcp</string></array>
 </dict></plist>"#,
             v = version
         );

@@ -64,6 +64,7 @@ pkg: bundle
 		--identifier $(IDENTIFIER) \
 		--version $(VERSION) \
 		--install-location / \
+		--scripts bundle/scripts \
 		--sign "$(PKG_SIGN)" \
 		$(PKG)
 	xcrun notarytool submit $(PKG) \

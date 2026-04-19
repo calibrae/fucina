@@ -1,0 +1,55 @@
+#!/bin/bash
+# Fucina pkg postinstall
+# Runs as root after binaries are installed. Creates a per-user config
+# scaffold if one doesn't exist yet and opens Fucina.app in the logged-in
+# user's session so they can register the runner and approve the Local
+# Network prompt.
+
+set -u
+
+# Identify the console user (the person who clicked "Install")
+CONSOLE_USER=$(stat -f "%Su" /dev/console 2>/dev/null)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+  # No GUI user — fresh boot or remote install; bail out of the GUI bits
+  exit 0
+fi
+USER_HOME=$(dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+[ -n "$USER_HOME" ] || USER_HOME="/Users/$CONSOLE_USER"
+
+RUNNER_DIR="$USER_HOME/gitea-runner-rs"
+CONFIG="$RUNNER_DIR/config.yaml"
+RUNNER_FILE="$RUNNER_DIR/.runner"
+
+mkdir -p "$RUNNER_DIR"
+chown "$CONSOLE_USER" "$RUNNER_DIR"
+
+if [ ! -f "$CONFIG" ]; then
+  cat > "$CONFIG" <<EOF
+# Fucina configuration — edit to point at your Gitea instance, then register:
+#   /usr/local/bin/fucina --config $CONFIG register --token <REGISTRATION_TOKEN>
+instance: https://gitea.example.com
+name: $(hostname -s)-rs
+labels:
+  - self-hosted:host
+  - macos-arm64:host
+capacity: 1
+fetch_interval: 2
+timeout: 10800
+work_dir: /tmp/fucina
+runner_file: $RUNNER_FILE
+EOF
+  chown "$CONSOLE_USER" "$CONFIG"
+  chmod 644 "$CONFIG"
+fi
+
+if [ ! -f "$RUNNER_FILE" ]; then
+  # Not yet registered — open config for editing, don't auto-launch the app
+  sudo -u "$CONSOLE_USER" /usr/bin/open -t "$CONFIG" || true
+  sudo -u "$CONSOLE_USER" /usr/bin/osascript -e \
+    "display dialog \"Fucina installed. Edit the opened config.yaml with your Gitea URL, then run:\n\n  fucina --config $CONFIG register --token <TOKEN>\n\nThen launch Fucina.app.\" buttons {\"OK\"} default button 1 with title \"Fucina\"" || true
+else
+  # Credentials present — launch the app
+  sudo -u "$CONSOLE_USER" /usr/bin/open -a /Applications/Fucina.app || true
+fi
+
+exit 0

@@ -140,8 +140,88 @@ fn set_login_item(path_or_name: &str, enabled: bool) {
         .output();
 }
 
+/// On macOS, BSD-socket `connect()` to RFC1918 addresses does not fire the
+/// Local Network Privacy prompt reliably. Initiating a Bonjour browse does.
+/// This spawns a short browse to surface the prompt on first launch — once
+/// the user grants access, the grant is keyed on the bundle ID and
+/// subsequent BSD-socket connects inherit it.
+fn trigger_local_network_prompt() {
+    use std::os::raw::{c_char, c_void};
+    use std::ptr;
+
+    #[repr(C)]
+    struct DNSServiceRefOpaque {
+        _private: [u8; 0],
+    }
+    type DNSServiceRef = *mut DNSServiceRefOpaque;
+
+    #[allow(non_camel_case_types)]
+    type DNSServiceBrowseReply = extern "C" fn(
+        sd_ref: DNSServiceRef,
+        flags: u32,
+        interface_index: u32,
+        error_code: i32,
+        service_name: *const c_char,
+        regtype: *const c_char,
+        reply_domain: *const c_char,
+        context: *mut c_void,
+    );
+
+    #[link(name = "System", kind = "framework")]
+    extern "C" {
+        fn DNSServiceBrowse(
+            sd_ref: *mut DNSServiceRef,
+            flags: u32,
+            interface_index: u32,
+            regtype: *const c_char,
+            domain: *const c_char,
+            callback: DNSServiceBrowseReply,
+            context: *mut c_void,
+        ) -> i32;
+        fn DNSServiceRefDeallocate(sd_ref: DNSServiceRef);
+    }
+
+    extern "C" fn cb(
+        _: DNSServiceRef,
+        _: u32,
+        _: u32,
+        _: i32,
+        _: *const c_char,
+        _: *const c_char,
+        _: *const c_char,
+        _: *mut c_void,
+    ) {
+    }
+
+    let regtype = c"_http._tcp";
+    let domain = c"local.";
+    let mut sd_ref: DNSServiceRef = ptr::null_mut();
+    let rc = unsafe {
+        DNSServiceBrowse(
+            &mut sd_ref,
+            0,
+            0,
+            regtype.as_ptr(),
+            domain.as_ptr(),
+            cb,
+            ptr::null_mut(),
+        )
+    };
+    if rc == 0 && !sd_ref.is_null() {
+        info!("Bonjour browse started to trigger Local Network prompt");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        unsafe { DNSServiceRefDeallocate(sd_ref) };
+    } else {
+        error!("DNSServiceBrowse failed: {}", rc);
+    }
+}
+
 pub fn run(config: Config) -> Result<()> {
     let mtm = MainThreadMarker::new().expect("macos_menu::run must be invoked on the main thread");
+
+    // Fire a Bonjour browse so macOS surfaces the Local Network permission
+    // prompt attributed to this bundle (BSD-socket connects don't trigger it).
+    trigger_local_network_prompt();
 
     // Daemon on worker thread
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
