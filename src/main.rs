@@ -57,7 +57,11 @@ fn main() -> Result<()> {
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
 
     match cli.command {
-        Commands::Register { token, name, labels } => {
+        Commands::Register {
+            token,
+            name,
+            labels,
+        } => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(cmd_register(
                 &config,

@@ -141,8 +141,7 @@ fn set_login_item(path_or_name: &str, enabled: bool) {
 }
 
 pub fn run(config: Config) -> Result<()> {
-    let mtm = MainThreadMarker::new()
-        .expect("macos_menu::run must be invoked on the main thread");
+    let mtm = MainThreadMarker::new().expect("macos_menu::run must be invoked on the main thread");
 
     // Daemon on worker thread
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -181,8 +180,7 @@ pub fn run(config: Config) -> Result<()> {
 
     // Status bar
     let status_bar = unsafe { NSStatusBar::systemStatusBar() };
-    let status_item: Retained<NSStatusItem> =
-        unsafe { status_bar.statusItemWithLength(-1.0) };
+    let status_item: Retained<NSStatusItem> = unsafe { status_bar.statusItemWithLength(-1.0) };
 
     let title = NSString::from_str("🔨");
     unsafe {
@@ -197,7 +195,8 @@ pub fn run(config: Config) -> Result<()> {
 
     let info = NSMenuItem::new(mtm);
     unsafe {
-        let _: () = msg_send![&info, setTitle: &*NSString::from_str(&format!("fucina — {}", config.name))];
+        let _: () =
+            msg_send![&info, setTitle: &*NSString::from_str(&format!("fucina — {}", config.name))];
         let _: () = msg_send![&info, setEnabled: false];
     }
     menu.addItem(&info);
@@ -224,13 +223,7 @@ pub fn run(config: Config) -> Result<()> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-    let login_item = add_item(
-        mtm,
-        &menu,
-        "Launch at Login",
-        sel!(toggleLogin:),
-        &handler,
-    );
+    let login_item = add_item(mtm, &menu, "Launch at Login", sel!(toggleLogin:), &handler);
     if login_item_enabled(&handler.ivars().login_item_name) {
         unsafe {
             let _: () = msg_send![&login_item, setState: STATE_ON];
