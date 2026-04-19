@@ -243,10 +243,8 @@ pub fn run(config: Config) -> Result<()> {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    // Handler
-    let log_path = std::env::current_dir()
-        .unwrap_or_default()
-        .join("runner.log");
+    // Handler — use the real log file we set up in main::log_file_path
+    let log_path = crate::log_file_path().unwrap_or_else(|| PathBuf::from("/tmp/fucina.log"));
     let handler = Handler::new(
         mtm,
         HandlerIvars {

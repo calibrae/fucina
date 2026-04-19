@@ -56,13 +56,50 @@ fn default_config_path() -> PathBuf {
     PathBuf::from("config.yaml")
 }
 
+/// macOS users will want `Open Log` in the menu bar to open a readable file.
+/// Route tracing to `~/Library/Logs/Fucina/fucina.log` in addition to stderr.
+pub fn log_file_path() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/Logs/Fucina/fucina.log"))
+}
+
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("fucina=debug".parse().unwrap()),
-        )
-        .init();
+    // Set up a file appender so the menu-bar Open Log item has something real
+    // to open. Leak the guard so logs keep flushing for the program's lifetime.
+    let file_guard = if let Some(path) = log_file_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "fucina.log".into());
+        let dir = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let appender = tracing_appender::rolling::never(dir, file_name);
+        let (nb, guard) = tracing_appender::non_blocking(appender);
+        let filter = tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive("fucina=debug".parse().unwrap());
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(nb)
+            .with_ansi(false)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("fucina=debug".parse().unwrap()),
+            )
+            .init();
+        None
+    };
+    // Keep the guard alive for the life of the process
+    std::mem::forget(file_guard);
 
     // Finder/LaunchServices may pass a -psn_X_Y process-serial-number arg
     // when launching .app bundles. Strip it before clap sees argv.
