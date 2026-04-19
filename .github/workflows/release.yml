@@ -109,10 +109,12 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
           OLD_KEYCHAINS=$(security list-keychains -d user | sed 's/"//g')
           security list-keychains -d user -s "$KEYCHAIN" $OLD_KEYCHAINS
-          echo "$APPLE_DEVID_APPLICATION_P12" | base64 -d > "$RUNNER_TEMP/app.p12"
-          echo "$APPLE_DEVID_INSTALLER_P12"   | base64 -d > "$RUNNER_TEMP/inst.p12"
-          security import "$RUNNER_TEMP/app.p12"  -k "$KEYCHAIN" -P "$APPLE_DEVID_APPLICATION_PASSWORD" -A
-          security import "$RUNNER_TEMP/inst.p12" -k "$KEYCHAIN" -P "$APPLE_DEVID_INSTALLER_PASSWORD"   -A
+          # Trim whitespace/newlines that GitHub may add to secret values
+          printf '%s' "$APPLE_DEVID_APPLICATION_P12" | tr -d '[:space:]' | base64 -D -o "$RUNNER_TEMP/app.p12"
+          printf '%s' "$APPLE_DEVID_INSTALLER_P12"   | tr -d '[:space:]' | base64 -D -o "$RUNNER_TEMP/inst.p12"
+          file "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
+          security import "$RUNNER_TEMP/app.p12"  -k "$KEYCHAIN" -P "$APPLE_DEVID_APPLICATION_PASSWORD" -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productbuild
+          security import "$RUNNER_TEMP/inst.p12" -k "$KEYCHAIN" -P "$APPLE_DEVID_INSTALLER_PASSWORD"   -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productbuild
           security set-key-partition-list -S apple-tool:,apple:,codesign:,pkgbuild:,productbuild: \
             -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
           rm "$RUNNER_TEMP/app.p12" "$RUNNER_TEMP/inst.p12"
