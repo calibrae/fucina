@@ -335,11 +335,15 @@ async fn execute_run_step(
         other => (other, vec!["-c"]),
     };
 
+    // Match GitHub/Gitea Actions semantics: steps run from the checked-out
+    // repo (job_dir/workspace), not from job_dir itself. step.working_directory
+    // is interpreted relative to that workspace root.
+    let workspace = job_dir.join("workspace");
     let work = step
         .working_directory
         .as_ref()
-        .map(|d| job_dir.join(d))
-        .unwrap_or_else(|| job_dir.to_path_buf());
+        .map(|d| workspace.join(d))
+        .unwrap_or(workspace);
 
     tokio::fs::create_dir_all(&work).await?;
     if let Some(user) = run_as {
