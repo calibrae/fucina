@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 
@@ -29,6 +31,7 @@ pub async fn execute(
     reporter: Arc<Reporter>,
     work_dir: &Path,
     run_as: Option<&str>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<proto::TaskResult> {
     // Decode workflow payload (base64-encoded YAML)
     let yaml_bytes = base64::engine::general_purpose::STANDARD
@@ -128,6 +131,7 @@ pub async fn execute(
                 &task.vars,
                 run_as,
                 &reporter,
+                &mut shutdown,
             )
             .await
         } else if let Some(uses) = &step.uses {
@@ -326,6 +330,7 @@ async fn execute_run_step(
     vars: &HashMap<String, String>,
     run_as: Option<&str>,
     reporter: &Reporter,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<proto::TaskResult> {
     let shell = step.shell.as_deref().unwrap_or("bash");
     let (shell_bin, shell_args) = match shell {
@@ -379,7 +384,9 @@ async fn execute_run_step(
         .envs(env_vars)
         .envs(&step.env)
         .envs(secrets)
-        .envs(vars);
+        .envs(vars)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     // When running as a different user, strip daemon-context env vars that
     // point at root-owned paths. sudo -H sets HOME to the target user's home;
@@ -392,27 +399,88 @@ async fn execute_run_step(
         }
     }
 
-    let output = cmd.output().await.context("failed to execute command")?;
+    let mut child = cmd.spawn().context("failed to spawn command")?;
 
-    // Log stdout
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        reporter.logf(line.to_string()).await;
+    // Stream stdout and stderr concurrently via a shared channel.
+    // This gives live log uploads during long-running steps (playwright, builds, etc.)
+    // instead of buffering everything until the command exits.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
+
+    let tx1 = tx.clone();
+    let out_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx1.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let tx2 = tx.clone();
+    let err_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx2.send(line).await.is_err() {
+                break;
+            }
+        }
+    });
+    drop(tx); // channel closes when both IO tasks finish
+
+    let mut line_count: u32 = 0;
+    const FLUSH_EVERY: u32 = 20;
+    let mut killed = false;
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => {
+                match msg {
+                    Some(line) => {
+                        reporter.logf(line).await;
+                        line_count += 1;
+                        if line_count % FLUSH_EVERY == 0 {
+                            let _ = reporter.flush_logs().await;
+                        }
+                    }
+                    None => break, // both stdout and stderr drained
+                }
+            }
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    // Runner is shutting down — kill the child process so the
+                    // spawned IO tasks exit, then report failure.
+                    let _ = child.kill().await;
+                    killed = true;
+                    break;
+                }
+            }
+        }
     }
 
-    // Log stderr
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stderr.lines() {
-        reporter.logf(line.to_string()).await;
-    }
+    let _ = out_task.await;
+    let _ = err_task.await;
+    let _ = reporter.flush_logs().await;
 
-    if output.status.success() {
+    if killed {
         reporter
-            .logf(format!("Exit code: {}", output.status.code().unwrap_or(0)))
+            .log("Runner shutting down — step killed")
+            .await;
+        let _ = reporter.flush_logs().await;
+        return Ok(proto::TaskResult::Failure);
+    }
+
+    let status = child.wait().await.context("failed to wait for command")?;
+
+    if status.success() {
+        reporter
+            .logf(format!("Exit code: {}", status.code().unwrap_or(0)))
             .await;
         Ok(proto::TaskResult::Success)
     } else {
-        let code = output.status.code().unwrap_or(-1);
+        let code = status.code().unwrap_or(-1);
         reporter.logf(format!("Exit code: {}", code)).await;
         error!("step '{}' failed with exit code {}", step.name, code);
         Ok(proto::TaskResult::Failure)

@@ -50,7 +50,7 @@ impl Poller {
                     }
                 }
                 _ = tokio::time::sleep(self.fetch_interval) => {
-                    if let Err(e) = self.poll_once().await {
+                    if let Err(e) = self.poll_once(shutdown.clone()).await {
                         warn!("poll error: {:#}", e);
                     }
                 }
@@ -66,7 +66,7 @@ impl Poller {
         Ok(())
     }
 
-    async fn poll_once(&mut self) -> Result<()> {
+    async fn poll_once(&mut self, shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
         debug!("fetching tasks (version={})", self.tasks_version);
         let resp = self.client.fetch_task(self.tasks_version).await?;
 
@@ -109,12 +109,17 @@ impl Poller {
 
         tokio::spawn(async move {
             let reporter = Arc::new(Reporter::new(client, task.id));
-            match runner::execute(&task, reporter, &work_dir, run_as.as_deref()).await {
+            match runner::execute(&task, reporter.clone(), &work_dir, run_as.as_deref(), shutdown).await {
                 Ok(result) => {
                     info!("task {} completed: {:?}", task.id, result);
                 }
                 Err(e) => {
                     error!("task {} failed: {:#}", task.id, e);
+                    // Best-effort: tell Gitea the task failed so the job doesn't
+                    // stay as a zombie in_progress forever.
+                    let _ = reporter
+                        .report_completed(crate::proto::TaskResult::Failure, vec![])
+                        .await;
                 }
             }
             drop(permit);
