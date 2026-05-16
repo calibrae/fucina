@@ -120,6 +120,12 @@ impl Poller {
             drop(permit);
         });
 
+        // Reset tasks_version so the next FetchTask sends 0 (< server's current version),
+        // causing Gitea to scan for pending tasks. Without this, after a task completes
+        // (success or failure), self.tasks_version == server's current version and Gitea
+        // returns no task indefinitely — even with a full queue of waiting jobs.
+        self.tasks_version = 0;
+
         Ok(())
     }
 }
