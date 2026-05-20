@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -199,7 +199,7 @@ impl Poller {
                     // Best-effort: tell Gitea the task failed so the job doesn't
                     // stay as a zombie in_progress forever.
                     let _ = reporter
-                        .report_completed(crate::proto::TaskResult::Failure, vec![])
+                        .report_completed(crate::proto::TaskResult::Failure, vec![], HashMap::new())
                         .await;
                 }
             }

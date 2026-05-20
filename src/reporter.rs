@@ -91,16 +91,28 @@ impl Reporter {
         .await
     }
 
-    /// Report task completed
-    pub async fn report_completed(&self, result: TaskResult, steps: Vec<StepState>) -> Result<()> {
+    /// Report task completed. `outputs` carries the job's resolved
+    /// `outputs:` block back to Gitea so downstream jobs see them in
+    /// their `needs.<job>.outputs` context.
+    pub async fn report_completed(
+        &self,
+        result: TaskResult,
+        steps: Vec<StepState>,
+        outputs: HashMap<String, String>,
+    ) -> Result<()> {
         self.close_logs().await?;
-        self.update_state(TaskState {
-            id: self.task_id,
-            result,
-            started_at: None,
-            stopped_at: Some(Timestamp::now()),
-            steps,
-        })
-        .await
+        self.client
+            .update_task(
+                TaskState {
+                    id: self.task_id,
+                    result,
+                    started_at: None,
+                    stopped_at: Some(Timestamp::now()),
+                    steps,
+                },
+                outputs,
+            )
+            .await?;
+        Ok(())
     }
 }
