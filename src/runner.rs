@@ -197,10 +197,7 @@ pub async fn execute(
                         .await;
                 }
             }
-            step_env.insert(
-                "GITHUB_OUTPUT".to_string(),
-                out_file.display().to_string(),
-            );
+            step_env.insert("GITHUB_OUTPUT".to_string(), out_file.display().to_string());
             step_env.insert("GITHUB_ENV".to_string(), env_file.display().to_string());
 
             // --- Execute ---
@@ -484,10 +481,7 @@ fn build_env(task: &Task, workspace: &Path, runner_temp: &Path) -> HashMap<Strin
         "GITHUB_WORKSPACE".to_string(),
         workspace.display().to_string(),
     );
-    env.insert(
-        "RUNNER_TEMP".to_string(),
-        runner_temp.display().to_string(),
-    );
+    env.insert("RUNNER_TEMP".to_string(), runner_temp.display().to_string());
     env.insert("RUNNER_OS".to_string(), runner_os());
     env.insert("RUNNER_ARCH".to_string(), runner_arch());
 
@@ -1180,8 +1174,7 @@ steps:
     #[test]
     fn parse_string_map_scalars() {
         // numbers and bools are stringified, not dropped
-        let val: serde_yaml::Value =
-            serde_yaml::from_str("PORT: 8080\nDEBUG: true\n").unwrap();
+        let val: serde_yaml::Value = serde_yaml::from_str("PORT: 8080\nDEBUG: true\n").unwrap();
         let map = parse_string_map(Some(&val));
         assert_eq!(map.get("PORT").unwrap(), "8080");
         assert_eq!(map.get("DEBUG").unwrap(), "true");
@@ -1339,7 +1332,10 @@ steps:
     fn empty_ctx(status: JobStatus) -> ExprCtx {
         let mut c = ExprCtx::new();
         c.status = status;
-        c.set("github", json!({"ref": "refs/tags/v1.0.0", "event_name": "push"}));
+        c.set(
+            "github",
+            json!({"ref": "refs/tags/v1.0.0", "event_name": "push"}),
+        );
         c
     }
 

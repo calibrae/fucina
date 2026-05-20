@@ -119,7 +119,10 @@ impl Poller {
 
         // Dedupe: Gitea may re-offer a task we already hold queued or running.
         if task_known(&self.active.lock().unwrap(), &self.pending, task.id) {
-            debug!("task {} already queued or running — ignoring duplicate", task.id);
+            debug!(
+                "task {} already queued or running — ignoring duplicate",
+                task.id
+            );
             self.tasks_version = 0;
             return Ok(());
         }
@@ -188,8 +191,14 @@ impl Poller {
 
         tokio::spawn(async move {
             let reporter = Arc::new(Reporter::new(client, task_id));
-            match runner::execute(&task, reporter.clone(), &work_dir, run_as.as_deref(), shutdown)
-                .await
+            match runner::execute(
+                &task,
+                reporter.clone(),
+                &work_dir,
+                run_as.as_deref(),
+                shutdown,
+            )
+            .await
             {
                 Ok(result) => {
                     info!("task {} completed: {:?}", task_id, result);

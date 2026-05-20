@@ -160,12 +160,16 @@ impl Context {
         let a: Vec<Value> = args.iter().map(|n| self.eval_node(n)).collect();
         match name.to_lowercase().as_str() {
             "contains" if a.len() == 2 => Value::Bool(fn_contains(&a[0], &a[1])),
-            "startswith" if a.len() == 2 => {
-                Value::Bool(coerce_str(&a[0]).to_lowercase().starts_with(&coerce_str(&a[1]).to_lowercase()))
-            }
-            "endswith" if a.len() == 2 => {
-                Value::Bool(coerce_str(&a[0]).to_lowercase().ends_with(&coerce_str(&a[1]).to_lowercase()))
-            }
+            "startswith" if a.len() == 2 => Value::Bool(
+                coerce_str(&a[0])
+                    .to_lowercase()
+                    .starts_with(&coerce_str(&a[1]).to_lowercase()),
+            ),
+            "endswith" if a.len() == 2 => Value::Bool(
+                coerce_str(&a[0])
+                    .to_lowercase()
+                    .ends_with(&coerce_str(&a[1]).to_lowercase()),
+            ),
             "format" if !a.is_empty() => Value::String(fn_format(&a)),
             "join" if !a.is_empty() => {
                 let sep = a.get(1).map(coerce_str).unwrap_or_else(|| ",".to_string());
@@ -371,11 +375,7 @@ fn fn_format(args: &[Value]) -> String {
 
 fn fn_join(arr: &Value, sep: &str) -> String {
     match arr {
-        Value::Array(items) => items
-            .iter()
-            .map(coerce_str)
-            .collect::<Vec<_>>()
-            .join(sep),
+        Value::Array(items) => items.iter().map(coerce_str).collect::<Vec<_>>().join(sep),
         other => coerce_str(other),
     }
 }
@@ -825,7 +825,10 @@ mod tests {
         c.set("secrets", json!({"TOKEN": "s3cr3t"}));
         c.set("inputs", json!({"tag": "v9.9.9"}));
         c.set("matrix", json!({"os": "linux"}));
-        c.set("steps", json!({"build": {"outputs": {"artifact": "out.tar"}}}));
+        c.set(
+            "steps",
+            json!({"build": {"outputs": {"artifact": "out.tar"}}}),
+        );
         c.set("needs", json!({"compile": {"outputs": {"ver": "1.0"}}}));
         c
     }
@@ -839,7 +842,10 @@ mod tests {
     #[test]
     fn simple_context_access() {
         let c = ctx();
-        assert_eq!(c.render("tag is ${{ github.ref }}"), "tag is refs/tags/v1.2.3");
+        assert_eq!(
+            c.render("tag is ${{ github.ref }}"),
+            "tag is refs/tags/v1.2.3"
+        );
     }
 
     #[test]
@@ -904,7 +910,10 @@ mod tests {
         let c = Context::new();
         assert_eq!(c.eval("contains('hello world', 'world')"), json!(true));
         assert_eq!(c.eval("contains('hello', 'XYZ')"), json!(false));
-        assert_eq!(c.eval("contains(fromJSON('[\"a\",\"b\"]'), 'b')"), json!(true));
+        assert_eq!(
+            c.eval("contains(fromJSON('[\"a\",\"b\"]'), 'b')"),
+            json!(true)
+        );
     }
 
     #[test]
@@ -912,16 +921,16 @@ mod tests {
         let c = ctx();
         assert_eq!(c.eval("startsWith(github.ref, 'refs/tags/')"), json!(true));
         assert_eq!(c.eval("endsWith(github.ref, 'v1.2.3')"), json!(true));
-        assert_eq!(c.eval("startsWith(github.ref, 'refs/heads/')"), json!(false));
+        assert_eq!(
+            c.eval("startsWith(github.ref, 'refs/heads/')"),
+            json!(false)
+        );
     }
 
     #[test]
     fn fn_format() {
         let c = Context::new();
-        assert_eq!(
-            c.eval("format('{0}-{1}-{0}', 'a', 'b')"),
-            json!("a-b-a")
-        );
+        assert_eq!(c.eval("format('{0}-{1}-{0}', 'a', 'b')"), json!("a-b-a"));
         assert_eq!(c.eval("format('{{literal}}')"), json!("{literal}"));
     }
 
@@ -932,10 +941,7 @@ mod tests {
             c.eval("join(fromJSON('[\"x\",\"y\",\"z\"]'), '/')"),
             json!("x/y/z")
         );
-        assert_eq!(
-            c.eval("join(fromJSON('[1,2,3]'))"),
-            json!("1,2,3")
-        );
+        assert_eq!(c.eval("join(fromJSON('[1,2,3]'))"), json!("1,2,3"));
     }
 
     #[test]
@@ -949,10 +955,7 @@ mod tests {
     #[test]
     fn steps_outputs_access() {
         let c = ctx();
-        assert_eq!(
-            c.render("${{ steps.build.outputs.artifact }}"),
-            "out.tar"
-        );
+        assert_eq!(c.render("${{ steps.build.outputs.artifact }}"), "out.tar");
     }
 
     #[test]
@@ -985,9 +988,9 @@ mod tests {
     #[test]
     fn condition_complex() {
         let c = ctx();
-        assert!(c.eval_condition(
-            "startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'"
-        ));
+        assert!(
+            c.eval_condition("startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'")
+        );
         assert!(!c.eval_condition(
             "startsWith(github.ref, 'refs/heads/') && github.event_name == 'push'"
         ));
