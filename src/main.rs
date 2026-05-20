@@ -1,5 +1,6 @@
 mod client;
 mod config;
+mod expr;
 mod poller;
 mod proto;
 mod reporter;
