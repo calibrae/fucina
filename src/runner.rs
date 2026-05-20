@@ -532,31 +532,67 @@ async fn execute_checkout(
         return Ok(proto::TaskResult::Failure);
     }
 
-    let repo_url = format!("{}/{}.git", server_url, repository);
-    reporter.logf(format!("Cloning {}", repo_url)).await;
+    let repo_url = build_repo_url(server_url, repository);
+    let workspace = job_dir.join("workspace");
+    reporter
+        .logf(format!("Cloning {} (ref {})", repo_url, ref_name))
+        .await;
 
-    let output = Command::new("git")
-        .args(["clone", "--depth", "1", "--branch"])
-        .arg(ref_name.trim_start_matches("refs/heads/"))
+    // Clone the default branch shallow, then resolve the requested ref
+    // explicitly. `git fetch <ref>` + `git checkout FETCH_HEAD` is
+    // ref-type-agnostic — it handles branches (refs/heads/…), tags
+    // (refs/tags/…) and raw SHAs uniformly. `git clone --branch` only
+    // accepts a *short* branch/tag name and chokes on full ref paths.
+    let clone = Command::new("git")
+        .args(["clone", "--depth", "1"])
         .arg(&repo_url)
-        .arg(job_dir.join("workspace"))
+        .arg(&workspace)
         .output()
         .await
         .context("git clone failed")?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        reporter.logf(line.to_string()).await;
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    for line in stderr.lines() {
-        reporter.logf(line.to_string()).await;
+    log_command_output(reporter, &clone).await;
+    if !clone.status.success() {
+        return Ok(proto::TaskResult::Failure);
     }
 
-    if output.status.success() {
+    let fetch = Command::new("git")
+        .args(["fetch", "--depth", "1", "origin"])
+        .arg(ref_name)
+        .current_dir(&workspace)
+        .output()
+        .await
+        .context("git fetch failed")?;
+    log_command_output(reporter, &fetch).await;
+    if !fetch.status.success() {
+        return Ok(proto::TaskResult::Failure);
+    }
+
+    let checkout = Command::new("git")
+        .args(["checkout", "FETCH_HEAD"])
+        .current_dir(&workspace)
+        .output()
+        .await
+        .context("git checkout failed")?;
+    log_command_output(reporter, &checkout).await;
+    if checkout.status.success() {
         Ok(proto::TaskResult::Success)
     } else {
         Ok(proto::TaskResult::Failure)
+    }
+}
+
+/// Build the clone URL. `GITHUB_SERVER_URL` arrives with a trailing slash,
+/// so trim it to avoid a `//` in the resulting path.
+fn build_repo_url(server_url: &str, repository: &str) -> String {
+    format!("{}/{}.git", server_url.trim_end_matches('/'), repository)
+}
+
+/// Stream a finished command's stdout then stderr into the task log.
+async fn log_command_output(reporter: &Reporter, output: &std::process::Output) {
+    for stream in [&output.stdout, &output.stderr] {
+        for line in String::from_utf8_lossy(stream).lines() {
+            reporter.logf(line.to_string()).await;
+        }
     }
 }
 
@@ -850,5 +886,24 @@ steps:
         assert!(run.contains("echo line1"));
         assert!(run.contains("echo line3"));
         assert_eq!(run.lines().count(), 3);
+    }
+
+    // --- build_repo_url ---
+
+    #[test]
+    fn build_repo_url_trims_trailing_slash() {
+        // GITHUB_SERVER_URL arrives with a trailing slash — must not double up.
+        assert_eq!(
+            build_repo_url("https://git.calii.net/", "cali/scrytti"),
+            "https://git.calii.net/cali/scrytti.git"
+        );
+    }
+
+    #[test]
+    fn build_repo_url_no_trailing_slash() {
+        assert_eq!(
+            build_repo_url("https://git.calii.net", "cali/scrytti"),
+            "https://git.calii.net/cali/scrytti.git"
+        );
     }
 }
