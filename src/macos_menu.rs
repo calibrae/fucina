@@ -29,8 +29,116 @@ const STATE_OFF: isize = 0;
 use objc2_foundation::{MainThreadMarker, NSString};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tracing::{error, info};
+
+// ── Self-update ───────────────────────────────────────────────────────────────
+
+static UPDATE_CHECKING: AtomicBool = AtomicBool::new(false);
+
+#[derive(serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+}
+
+/// Dispatch a closure to the main thread via GCD. Safe to call from any thread.
+///
+/// `dispatch_get_main_queue()` is a C macro that expands to `&_dispatch_main_q`;
+/// there is no exported function symbol, so we reference the queue object directly.
+unsafe fn dispatch_on_main<F: FnOnce() + Send + 'static>(f: F) {
+    // libdispatch is re-exported by libSystem, which Rust links automatically on macOS.
+    extern "C" {
+        static _dispatch_main_q: std::ffi::c_void;
+        fn dispatch_async_f(
+            queue: *const std::ffi::c_void,
+            context: *mut std::ffi::c_void,
+            work: unsafe extern "C" fn(*mut std::ffi::c_void),
+        );
+    }
+    unsafe extern "C" fn trampoline(ctx: *mut std::ffi::c_void) {
+        let f = Box::from_raw(ctx as *mut Box<dyn FnOnce() + Send>);
+        f();
+    }
+    let boxed = Box::into_raw(Box::new(Box::new(f) as Box<dyn FnOnce() + Send>));
+    dispatch_async_f(&_dispatch_main_q, boxed as *mut _, trampoline);
+}
+
+/// Show a simple one-button NSAlert. Must be called on the main thread.
+unsafe fn show_simple_alert(title: &str, body: &str) {
+    use objc2::runtime::AnyClass;
+    let Some(cls) = AnyClass::get("NSAlert") else {
+        return;
+    };
+    let alert: Retained<AnyObject> = msg_send_id![cls, new];
+    let _: () = msg_send![&alert, setMessageText: &*NSString::from_str(title)];
+    let _: () = msg_send![&alert, setInformativeText: &*NSString::from_str(body)];
+    let _: () = msg_send![&alert, addButtonWithTitle: &*NSString::from_str("OK")];
+    let _: isize = msg_send![&alert, runModal];
+}
+
+/// Call the GitHub releases API and return the latest tag (e.g. "v0.2.9").
+async fn fetch_latest_tag() -> anyhow::Result<String> {
+    let release: GhRelease = reqwest::Client::builder()
+        .user_agent(concat!("fucina/", env!("CARGO_PKG_VERSION")))
+        .build()?
+        .get("https://api.github.com/repos/calibrae/fucina/releases/latest")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(release.tag_name)
+}
+
+/// Download the signed .pkg for `tag` to ~/Downloads and open it in Installer.app.
+fn launch_pkg_installer(tag: String) {
+    std::thread::spawn(move || {
+        let ver = tag.trim_start_matches('v');
+        let url = format!(
+            "https://github.com/calibrae/fucina/releases/download/{tag}/fucina-{ver}.pkg"
+        );
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                error!("self-update: runtime failed: {e}");
+                return;
+            }
+        };
+        let result: anyhow::Result<PathBuf> = rt.block_on(async {
+            let bytes = reqwest::Client::builder()
+                .user_agent(concat!("fucina/", env!("CARGO_PKG_VERSION")))
+                .build()?
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .bytes()
+                .await?;
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            let path = PathBuf::from(home)
+                .join("Downloads")
+                .join(format!("fucina-{ver}.pkg"));
+            tokio::fs::write(&path, &bytes).await?;
+            Ok(path)
+        });
+        match result {
+            Ok(path) => {
+                info!("self-update: opening installer at {}", path.display());
+                let _ = Command::new("/usr/bin/open").arg(&path).spawn();
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                error!("self-update: download failed: {msg}");
+                unsafe {
+                    dispatch_on_main(move || {
+                        show_simple_alert("Download Failed", &msg);
+                    });
+                }
+            }
+        }
+    });
+}
 
 use crate::config::Config;
 
@@ -76,6 +184,54 @@ declare_class!(
             let _ = Command::new("/usr/bin/open")
                 .arg(&self.ivars().instance_url)
                 .spawn();
+        }
+
+        #[method(checkForUpdates:)]
+        fn check_for_updates(&self, _sender: Option<&AnyObject>) {
+            if UPDATE_CHECKING.swap(true, Ordering::Relaxed) {
+                return; // already in progress
+            }
+            std::thread::spawn(|| {
+                let current = concat!("v", env!("CARGO_PKG_VERSION"));
+                let result = tokio::runtime::Runtime::new()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|rt| rt.block_on(fetch_latest_tag()));
+                UPDATE_CHECKING.store(false, Ordering::Relaxed);
+                unsafe {
+                    dispatch_on_main(move || match result {
+                        Err(e) => show_simple_alert("Update Check Failed", &format!("{e:#}")),
+                        Ok(ref tag) if tag == current => show_simple_alert(
+                            "fucina is up to date",
+                            &format!("You're running the latest version ({current})."),
+                        ),
+                        Ok(tag) => {
+                            use objc2::runtime::AnyClass;
+                            let install = {
+                                let Some(cls) = AnyClass::get("NSAlert") else {
+                                    return;
+                                };
+                                let alert: Retained<AnyObject> = msg_send_id![cls, new];
+                                let _: () = msg_send![&alert, setMessageText:
+                                    &*NSString::from_str(&format!("Update available: {tag}"))];
+                                let _: () = msg_send![&alert, setInformativeText:
+                                    &*NSString::from_str(&format!(
+                                        "You're running {current}. Install {tag} now?\n\
+                                         The signed installer will open automatically."
+                                    ))];
+                                let _: () = msg_send![&alert, addButtonWithTitle:
+                                    &*NSString::from_str("Install")];
+                                let _: () = msg_send![&alert, addButtonWithTitle:
+                                    &*NSString::from_str("Later")];
+                                let r: isize = msg_send![&alert, runModal];
+                                r == 1000 // NSAlertFirstButtonReturn
+                            };
+                            if install {
+                                launch_pkg_installer(tag);
+                            }
+                        }
+                    });
+                }
+            });
         }
 
         #[method(toggleLogin:)]
@@ -263,6 +419,13 @@ pub fn run(config: Config) -> Result<()> {
         &menu,
         "Open Gitea Runners",
         sel!(openRunner:),
+        &handler,
+    );
+    add_item(
+        mtm,
+        &menu,
+        "Check for Updates\u{2026}",
+        sel!(checkForUpdates:),
         &handler,
     );
 
