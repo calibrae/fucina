@@ -16,8 +16,28 @@ pub struct ConnectClient {
 
 impl ConnectClient {
     pub fn new(api_base: &str) -> Result<Self> {
+        // Timeouts are load-bearing. Without them a stalled or half-open TCP
+        // connection makes send().await block forever — and since every RPC
+        // (FetchTask, report_started/completed, UpdateLog) is unbounded, a
+        // single dead connection freezes a worker with the semaphore permit
+        // still held: the task shows "running" in Gitea with no process, and
+        // the runner stops dispatching. The classic trigger is sleep/wake on
+        // the Mac Minis silently killing a pooled keep-alive connection that
+        // the next RPC then reuses. Bounding each request (not the job) breaks
+        // the hang without ever capping real build duration.
+        //   - connect_timeout: fail fast on an unreachable/dead peer
+        //   - timeout: ceiling on any single RPC; FetchTask returns promptly
+        //     (the runner controls cadence via fetch_interval, it is not a
+        //     long-poll), and log batches are small, so 60s is generous
+        //   - tcp_keepalive: let the OS detect a dead peer mid-request
+        //   - pool_idle_timeout: retire idle pooled connections so a stale
+        //     post-sleep socket is dropped rather than reused-and-hung
         let http = Client::builder()
             .use_rustls_tls()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .context("failed to create HTTP client")?;
 
