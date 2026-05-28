@@ -9,6 +9,7 @@ use crate::client::ConnectClient;
 use crate::proto::Task;
 use crate::reporter::Reporter;
 use crate::runner;
+use crate::taskstate::TaskStateFile;
 
 /// Upper bound on tasks held in the pending queue. A task that arrives when
 /// all worker slots are busy is queued rather than dropped; only a queue this
@@ -26,6 +27,8 @@ pub struct Poller {
     pending: VecDeque<Task>,
     /// IDs of tasks currently executing — for deduping Gitea re-offers.
     active: Arc<Mutex<HashSet<i64>>>,
+    /// Crash-safe on-disk record of in-flight task IDs.
+    task_state: Arc<TaskStateFile>,
 }
 
 /// True if `id` is already running or queued — used to dedupe Gitea
@@ -41,6 +44,7 @@ impl Poller {
         fetch_interval_secs: u64,
         work_dir: PathBuf,
         run_as: Option<String>,
+        task_state: Arc<TaskStateFile>,
     ) -> Self {
         Self {
             client,
@@ -51,6 +55,7 @@ impl Poller {
             tasks_version: 0,
             pending: VecDeque::new(),
             active: Arc::new(Mutex::new(HashSet::new())),
+            task_state,
         }
     }
 
@@ -185,9 +190,13 @@ impl Poller {
         let work_dir = self.work_dir.clone();
         let run_as = self.run_as.clone();
         let active = self.active.clone();
+        let task_state = self.task_state.clone();
         let task_id = task.id;
 
         active.lock().unwrap().insert(task_id);
+        // Persist before spawning so a crash between here and task completion
+        // is caught on the next startup.
+        task_state.add(task_id);
 
         tokio::spawn(async move {
             let reporter = Arc::new(Reporter::new(client, task_id));
@@ -212,6 +221,8 @@ impl Poller {
                         .await;
                 }
             }
+            // Remove from on-disk state — task is resolved.
+            task_state.remove(task_id);
             active.lock().unwrap().remove(&task_id);
             drop(permit);
         });

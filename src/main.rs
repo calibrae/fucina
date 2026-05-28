@@ -5,6 +5,7 @@ mod poller;
 mod proto;
 mod reporter;
 mod runner;
+mod taskstate;
 
 #[cfg(target_os = "macos")]
 mod macos_menu;
@@ -248,12 +249,39 @@ pub async fn run_daemon(
 
     tokio::fs::create_dir_all(&config.work_dir).await?;
 
+    // Cancel any tasks that were in-flight when the previous process died.
+    // Without this, Gitea keeps them as "running" and eventually stops
+    // offering new work to this runner (stale task accumulation).
+    let task_state = Arc::new(taskstate::TaskStateFile::alongside(&config.runner_file));
+    let stale_ids = task_state.drain_stale();
+    if !stale_ids.is_empty() {
+        warn!(
+            "found {} stale in-flight task(s) from previous run: {:?} — reporting as FAILURE",
+            stale_ids.len(),
+            stale_ids
+        );
+        for id in stale_ids {
+            let state = proto::TaskState {
+                id,
+                result: proto::TaskResult::Failure,
+                started_at: None,
+                stopped_at: Some(proto::Timestamp::now()),
+                steps: vec![],
+            };
+            match client.update_task(state, std::collections::HashMap::new()).await {
+                Ok(_) => info!("cancelled stale task {}", id),
+                Err(e) => warn!("failed to cancel stale task {}: {:#}", id, e),
+            }
+        }
+    }
+
     let mut poller = poller::Poller::new(
         client,
         config.capacity,
         config.fetch_interval,
         config.work_dir.clone(),
         config.run_as.clone(),
+        task_state,
     );
     if let Some(user) = &config.run_as {
         info!("workflow steps will run as user '{}' via sudo", user);
