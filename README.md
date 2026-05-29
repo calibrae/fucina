@@ -79,13 +79,16 @@ The daemon declares capabilities, polls for jobs, executes them, and reports res
 
 ```
 src/
-  main.rs       CLI entry point (register, daemon)
+  main.rs       CLI entry point (register, daemon) + stale-task recovery
   config.rs     YAML config + .runner credentials
-  client.rs     Connect protocol HTTP client
+  client.rs     Connect protocol HTTP client (bounded by timeouts)
   proto.rs      Request/response types (protobuf JSON)
-  poller.rs     Async task polling loop
-  runner.rs     Workflow YAML parsing + host execution
+  poller.rs     Async task polling loop + capacity semaphore
+  runner.rs     Workflow YAML parsing + host execution + if: evaluation
   reporter.rs   Log streaming + task state reporting
+  expr.rs       GitHub Actions ${{ }} expression evaluator
+  taskstate.rs  Crash-safe on-disk record of in-flight task IDs
+  macos_menu.rs Status-bar menu + opt-in self-update (macOS only)
 ```
 
 ### Protocol
@@ -119,7 +122,21 @@ Host-mode only. Each workflow step runs as a shell subprocess:
 - `run:` steps execute via bash (default), sh, or python
 - `uses: actions/checkout` is handled natively via `git clone`
 - Other `uses:` actions are skipped with a warning
-- Basic `if:` conditions supported: `always()`, `failure()`, `success()`, `cancelled()`
+- Full `${{ }}` expression evaluation (contexts, operators, `contains`/`startsWith`/`format`/`hashFiles`/…) in `env:`, `with:`, `if:` and `run:`
+- Env layering (workflow < job < step) and `$GITHUB_ENV` / `$GITHUB_OUTPUT` propagation
+- **Step-level `if:`** with GitHub's implicit `success() &&` prefix
+- **Job-level `if:`** evaluated against the `needs` results — verbatim, with **no** implicit `success()` prefix (matching GitHub job semantics)
+
+#### Why fucina evaluates the job-level `if:`
+
+Gitea resolves the `needs` DAG server-side, but it does **not** decide a needs-blocked job's fate when that job carries an `if:`. Per Gitea's `services/actions/job_emitter.go`, a blocked job whose dependency failed is set to `StatusSkipped` **only if it has no `if:`**; if it has one, Gitea marks it `StatusWaiting` and hands it to the runner to evaluate. So honouring the job `if:` is the runner's responsibility — if the runner ignores it, a job like `deploy: { needs: check, if: github.event_name == 'push' }` runs even when `check` failed (it shipped a broken build to prod before this was fixed). fucina now evaluates the job `if:` with `success()/failure()/cancelled()` reflecting the `needs` outcomes and reports the task as `Skipped` when the condition is false.
+
+> **Workflow author note:** a *custom* job-level `if:` replaces the implicit `success()` gate that `needs:` would otherwise apply. If you want the gate, write `if: success() && (…)` — or omit the `if:` entirely.
+
+### Reliability
+
+- **Bounded RPCs.** Every Connect call carries a connect/request timeout plus TCP keep-alive and a pooled-connection idle timeout. A stalled or half-open connection (classically, a Mac waking from sleep with a dead keep-alive socket) can no longer block a worker forever — the call fails fast and the slot self-heals into a `Failure` report instead of wedging the runner. The timeouts bound the network calls, never the job itself.
+- **Crash-safe task recovery.** In-flight task IDs are written to `active-tasks.json`. If the process is killed mid-job, the next startup reports those orphaned tasks to Gitea as `Failure`, so Gitea doesn't keep them `running` forever and stop offering new work.
 
 ## Configuration Reference
 
@@ -208,15 +225,17 @@ Debug level logs every FetchTask response body (truncated) — which is how we f
 - Job polling with configurable interval
 - `run:` step execution (bash, sh, python)
 - `actions/checkout` via native git clone
+- `${{ }}` expression evaluation in `env:`/`with:`/`if:`/`run:`
+- Step-level **and** job-level `if:` conditions (`always()`, `failure()`, `success()`, `cancelled()`, and arbitrary expressions)
+- Env layering + `$GITHUB_ENV` / `$GITHUB_OUTPUT` + job `outputs:`
 - Log streaming to Gitea
 - Task/step state reporting with RFC 3339 timestamps
-- `if:` conditions (`always()`, `failure()`, `success()`, `cancelled()`)
+- Timeout-bounded RPCs + crash-safe in-flight task recovery
 - Graceful shutdown (SIGINT/SIGTERM)
 - Concurrent job execution with capacity limits
 
 ## Not Supported (yet)
 
-- Expression evaluation (`${{ github.ref }}`)
 - Arbitrary `uses:` actions (only checkout)
 - Matrix strategies
 - Artifacts / caching
@@ -229,7 +248,7 @@ Debug level logs every FetchTask response body (truncated) — which is how we f
 cargo test
 ```
 
-52 unit tests covering: Connect protocol serialization (int64 as string, RFC 3339 timestamps, camelCase, enum variants), config YAML parsing + defaults, credentials roundtrip, workflow YAML parsing, job/step extraction, env construction, `if:` condition evaluation.
+110 unit tests covering: Connect protocol serialization (int64 as string, RFC 3339 timestamps, camelCase, enum variants), config YAML parsing + defaults, credentials roundtrip, workflow YAML parsing, job/step extraction, env construction + layering, `${{ }}` expression evaluation, step- and job-level `if:` evaluation (including `needs`-driven job status), `$GITHUB_OUTPUT`/`$GITHUB_ENV` parsing, and crash-safe task-state roundtrips.
 
 ## References
 

@@ -63,11 +63,36 @@ pub async fn execute(
         return Ok(proto::TaskResult::Success);
     }
 
-    // Set up working directory. workspace/ holds the checked-out repo,
-    // _temp/ is RUNNER_TEMP and also holds per-step GITHUB_OUTPUT/GITHUB_ENV.
+    // Working directory layout. workspace/ holds the checked-out repo, _temp/
+    // is RUNNER_TEMP and also holds per-step GITHUB_OUTPUT/GITHUB_ENV.
     let job_dir = work_dir.join(format!("task-{}", task.id));
     let workspace = job_dir.join("workspace");
     let runner_temp = job_dir.join("_temp");
+
+    // --- Job-level `if:` -------------------------------------------------
+    // Gitea resolves the needs DAG server-side, but a job that carries an
+    // `if:` is NOT skipped by Gitea when a dependency fails — it is marked
+    // runnable and handed to us to evaluate (services/actions/job_emitter.go:
+    // a blocked job becomes StatusWaiting rather than StatusSkipped iff it has
+    // an `if:`). So honouring the job `if:` is the runner's responsibility;
+    // without this we run every job we are handed. Unlike a step `if:`, a job
+    // `if:` gets NO implicit `success()` prefix — it is evaluated verbatim,
+    // with the status functions reflecting the *needs* results. That is
+    // exactly why a failed dependency does not stop a job whose `if:` is
+    // otherwise true (the cali/niveau deploy-past-failed-check case).
+    {
+        let mut job_ctx = build_expr_context(task, &workspace, &runner_temp);
+        job_ctx.status = job_status_from_needs(&task.needs);
+        if !should_run_job(job.get("if"), &job_ctx) {
+            let cond = job.get("if").and_then(|v| v.as_str()).unwrap_or("");
+            info!("job skipped — `if` condition not satisfied: {}", cond);
+            reporter
+                .report_completed(proto::TaskResult::Skipped, vec![], HashMap::new())
+                .await?;
+            return Ok(proto::TaskResult::Skipped);
+        }
+    }
+
     tokio::fs::create_dir_all(&workspace)
         .await
         .context("failed to create workspace directory")?;
@@ -609,6 +634,45 @@ fn should_run_step(step: &Step, ctx: &ExprCtx) -> bool {
                 result && ctx.status == JobStatus::Success
             }
         }
+    }
+}
+
+/// Compute the job-level status from the results of its `needs` dependencies.
+/// This drives `success()/failure()/cancelled()` inside a job-level `if:`. A
+/// failed dependency makes the job `Failure`, a cancelled one `Cancelled`;
+/// otherwise `Success`.
+fn job_status_from_needs(needs: &HashMap<String, proto::TaskNeed>) -> JobStatus {
+    let mut cancelled = false;
+    for need in needs.values() {
+        match need.result {
+            proto::TaskResult::Failure => return JobStatus::Failure,
+            proto::TaskResult::Cancelled => cancelled = true,
+            _ => {}
+        }
+    }
+    if cancelled {
+        JobStatus::Cancelled
+    } else {
+        JobStatus::Success
+    }
+}
+
+/// Decide whether a job runs, honouring its job-level `if:`.
+///
+/// Gitea hands us a needs-blocked job (rather than skipping it itself) only
+/// when the job has an `if:`, delegating the decision to the runner. Unlike a
+/// step `if:`, a job `if:` carries NO implicit `success()` prefix: it is
+/// evaluated verbatim, so e.g. `if: github.event_name == 'push'` runs even
+/// after a needed job failed. A job with no `if:` is always run — Gitea only
+/// dispatches such a job once all its needs have succeeded.
+fn should_run_job(if_field: Option<&serde_yaml::Value>, ctx: &ExprCtx) -> bool {
+    match if_field {
+        None => true,
+        Some(serde_yaml::Value::Bool(b)) => *b,
+        Some(v) => match v.as_str() {
+            Some(cond) => ctx.eval_condition(cond),
+            None => true,
+        },
     }
 }
 
@@ -1414,6 +1478,81 @@ steps:
         assert!(should_run_step(
             &step_with_if(Some("always() && startsWith(github.ref, 'refs/tags/')")),
             &empty_ctx(JobStatus::Failure)
+        ));
+    }
+
+    // --- job-level if: (needs-gate delegation) ---
+
+    fn need(result: proto::TaskResult) -> proto::TaskNeed {
+        proto::TaskNeed {
+            outputs: HashMap::new(),
+            result,
+        }
+    }
+
+    #[test]
+    fn job_status_from_needs_variants() {
+        assert_eq!(job_status_from_needs(&HashMap::new()), JobStatus::Success);
+
+        let ok = HashMap::from([("a".to_string(), need(proto::TaskResult::Success))]);
+        assert_eq!(job_status_from_needs(&ok), JobStatus::Success);
+
+        let failed = HashMap::from([
+            ("a".to_string(), need(proto::TaskResult::Success)),
+            ("b".to_string(), need(proto::TaskResult::Failure)),
+        ]);
+        assert_eq!(job_status_from_needs(&failed), JobStatus::Failure);
+
+        // failure wins over cancellation
+        let mixed = HashMap::from([
+            ("a".to_string(), need(proto::TaskResult::Cancelled)),
+            ("b".to_string(), need(proto::TaskResult::Failure)),
+        ]);
+        assert_eq!(job_status_from_needs(&mixed), JobStatus::Failure);
+
+        let cancelled = HashMap::from([("a".to_string(), need(proto::TaskResult::Cancelled))]);
+        assert_eq!(job_status_from_needs(&cancelled), JobStatus::Cancelled);
+    }
+
+    #[test]
+    fn should_run_job_no_if_always_runs() {
+        // Gitea only dispatches a no-if job once its needs succeeded.
+        assert!(should_run_job(None, &empty_ctx(JobStatus::Failure)));
+    }
+
+    #[test]
+    fn should_run_job_if_is_verbatim_no_implicit_success() {
+        // The cali/niveau case: `if: github.event_name == 'push'` still runs
+        // after a needed job failed — a job `if:` gets NO implicit success().
+        let cond = serde_yaml::Value::String("github.event_name == 'push'".to_string());
+        assert!(should_run_job(Some(&cond), &empty_ctx(JobStatus::Failure)));
+    }
+
+    #[test]
+    fn should_run_job_explicit_success_gate_skips_on_failed_need() {
+        let cond = serde_yaml::Value::String("success()".to_string());
+        assert!(!should_run_job(Some(&cond), &empty_ctx(JobStatus::Failure)));
+        assert!(should_run_job(Some(&cond), &empty_ctx(JobStatus::Success)));
+    }
+
+    #[test]
+    fn should_run_job_always_and_failure() {
+        let always = serde_yaml::Value::String("always()".to_string());
+        assert!(should_run_job(Some(&always), &empty_ctx(JobStatus::Failure)));
+        let failure = serde_yaml::Value::String("failure()".to_string());
+        assert!(should_run_job(Some(&failure), &empty_ctx(JobStatus::Failure)));
+        assert!(!should_run_job(Some(&failure), &empty_ctx(JobStatus::Success)));
+    }
+
+    #[test]
+    fn should_run_job_bool_literal() {
+        assert!(should_run_job(
+            Some(&serde_yaml::Value::Bool(true)),
+            &empty_ctx(JobStatus::Success)
+        ));
+        assert!(!should_run_job(
+            Some(&serde_yaml::Value::Bool(false)),
+            &empty_ctx(JobStatus::Success)
         ));
     }
 
