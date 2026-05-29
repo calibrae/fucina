@@ -268,7 +268,10 @@ pub async fn run_daemon(
                 stopped_at: Some(proto::Timestamp::now()),
                 steps: vec![],
             };
-            match client.update_task(state, std::collections::HashMap::new()).await {
+            match client
+                .update_task(state, std::collections::HashMap::new())
+                .await
+            {
                 Ok(_) => info!("cancelled stale task {}", id),
                 Err(e) => warn!("failed to cancel stale task {}: {:#}", id, e),
             }

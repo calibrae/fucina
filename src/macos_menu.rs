@@ -95,9 +95,8 @@ async fn fetch_latest_tag() -> anyhow::Result<String> {
 fn launch_pkg_installer(tag: String) {
     std::thread::spawn(move || {
         let ver = tag.trim_start_matches('v');
-        let url = format!(
-            "https://github.com/calibrae/fucina/releases/download/{tag}/fucina-{ver}.pkg"
-        );
+        let url =
+            format!("https://github.com/calibrae/fucina/releases/download/{tag}/fucina-{ver}.pkg");
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {

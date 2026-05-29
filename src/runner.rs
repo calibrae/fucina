@@ -1538,10 +1538,19 @@ steps:
     #[test]
     fn should_run_job_always_and_failure() {
         let always = serde_yaml::Value::String("always()".to_string());
-        assert!(should_run_job(Some(&always), &empty_ctx(JobStatus::Failure)));
+        assert!(should_run_job(
+            Some(&always),
+            &empty_ctx(JobStatus::Failure)
+        ));
         let failure = serde_yaml::Value::String("failure()".to_string());
-        assert!(should_run_job(Some(&failure), &empty_ctx(JobStatus::Failure)));
-        assert!(!should_run_job(Some(&failure), &empty_ctx(JobStatus::Success)));
+        assert!(should_run_job(
+            Some(&failure),
+            &empty_ctx(JobStatus::Failure)
+        ));
+        assert!(!should_run_job(
+            Some(&failure),
+            &empty_ctx(JobStatus::Success)
+        ));
     }
 
     #[test]
