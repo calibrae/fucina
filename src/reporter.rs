@@ -63,13 +63,36 @@ impl Reporter {
         Ok(*idx)
     }
 
-    /// Send final log flush with no_more=true
+    /// Send the final log flush with `no_more=true`, finalizing the task's log.
+    ///
+    /// Gitea's `UpdateLog` handler short-circuits on `len(rows) == 0` *before*
+    /// it honors `no_more` (routers/api/actions/runner/runner.go), so a bare
+    /// empty `no_more=true` request never reaches the `TransferLogs` call that
+    /// sets `log_in_storage` — the log is stranded in Gitea's `dbfs` forever
+    /// (it stays viewable, but `dbfs_data` leaks and never moves to the storage
+    /// backend). The fix, mirroring the official act_runner: make the final
+    /// request carry at least one row, injecting an empty sentinel line when
+    /// nothing is buffered. (Upstream fix: gitea PR #37631, ~v1.28 — drop the
+    /// sentinel once every Gitea we target includes it.)
     pub async fn close_logs(&self) -> Result<()> {
-        self.flush_logs().await?;
+        let mut rows: Vec<LogRow> = {
+            let mut buf = self.log_buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if rows.is_empty() {
+            rows.push(LogRow {
+                time: Timestamp::now(),
+                content: String::new(),
+            });
+        }
         let index = *self.log_index.lock().await;
-        self.client
-            .update_log(self.task_id, index, vec![], true)
+        let count = rows.len() as i64;
+        let resp = self
+            .client
+            .update_log(self.task_id, index, rows, true)
             .await?;
+        let mut idx = self.log_index.lock().await;
+        *idx = resp.ack_index.max(index + count);
         Ok(())
     }
 
