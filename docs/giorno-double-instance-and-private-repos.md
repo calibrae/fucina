@@ -1,0 +1,127 @@
+# Field notes — the giorno double-instance and the private-repo checkout failures
+
+*Written after the first real production pipeline ran on fucina (capucine CI, 2026-07-22).
+Everything below was observed live, not theorized.*
+
+## TL;DR
+
+1. **giorno was running TWO fucina instances at once** — a stale root LaunchDaemon binary
+   (built May 29) and a newer `Fucina.app` — so identical jobs randomly passed or failed
+   depending on which instance grabbed the task.
+2. **The checkout step cannot authenticate**: it does a bare anonymous HTTPS `git clone`.
+   On a private repo it only works where ambient git credentials happen to exist
+   (speedwagon's user keychain) and fails everywhere else. Resolution for the LAN Gitea:
+   make the repo public. Proper fix: token support in `execute_checkout`.
+3. Bonus gap found the same day: workflow-level `env:` is not applied to run steps.
+
+---
+
+## 1. The double instance on giorno
+
+### Symptom
+
+Same workflow, same commit, same label (`macos-arm64`): the `front-terrain` job succeeded
+while `front-bureau` failed with `npm ci` printing its own help text and exiting 1.
+
+The npm debug logs on giorno told the real story via their `cwd` lines:
+
+```
+task-809 (failed):   cwd /Users/cali/gitea-runner-rs/work/task-809/frontend
+task-810 (passed):   cwd /Users/cali/gitea-runner-rs/work/task-810/workspace/terrain
+```
+
+`task-809` ran the step in `<job_dir>/frontend` — **without the `workspace/` segment** —
+an empty directory with no `package-lock.json`, hence npm's usage dump. `task-810` used
+the correct `workspace/`-relative path. Same machine, two different path-join behaviours.
+
+### Cause
+
+Two runners were live simultaneously on giorno:
+
+| Instance | Binary | Built | Behaviour |
+|---|---|---|---|
+| LaunchDaemon `net.calii.fucina` (root, pid 846) | `/usr/local/bin/fucina` | **May 29** | joins `working-directory` onto the *task* dir → broken |
+| `Fucina.app` (pid 1467) | app bundle | newer | correct `workspace.join(...)` |
+
+The May 29 binary predates the current `src/runner.rs` logic, which is already correct:
+
+```rust
+// Match GitHub/Gitea Actions semantics: steps run from the checked-out
+// repo (workspace), not from job_dir itself.
+let work = working_directory
+    .map(|d| workspace.join(d))
+    .unwrap_or_else(|| workspace.to_path_buf());
+```
+
+So this was a **binary deployment problem, not a source bug** — plus an operational one:
+two registered runners polling the same Gitea with the same labels is a lottery.
+
+### Aggravating factor: logging has been dead since May 16
+
+The LaunchDaemon plist points `StandardOutPath`/`StandardErrorPath` at
+`/Users/cali/gitea-runner-rs/runner.log`, but that file's last write is May 16
+(a SIGTERM shutdown of the *old user-level* agent). The root daemon has produced no
+readable log since. Diagnosis had to go through:
+
+- Gitea API: `GET /api/v1/repos/{owner}/{repo}/actions/runs/{id}/jobs` →
+  `GET /api/v1/repos/{owner}/{repo}/actions/jobs/{job_id}/logs`
+- npm's own debug logs (`~/.npm/_logs/*-debug-0.log`, `verbose cwd` lines) on the runner host
+
+### Remediation checklist for giorno
+
+1. Rebuild fucina from current source and sign it:
+   `codesign --force --options runtime --sign "Developer ID Application: Nico Bousquet (XJQQCN392F)" --identifier "com.gitea.fucina" --entitlements entitlements.plist target/release/fucina`
+2. Replace `/usr/local/bin/fucina`, restart the LaunchDaemon.
+3. **Kill the duplicate**: exactly one runner instance per machine. Decide whether the
+   LaunchDaemon or the app bundle is the canonical one, remove the other from launch.
+4. Fix the log redirection (or give fucina its own file logger so launchd redirection
+   stops being a single point of diagnosis failure).
+5. Only then un-pin consumer workflows from `runs-on: speedwagon` back to `macos-arm64`.
+
+---
+
+## 2. The private-repo checkout fuckery
+
+### Symptom
+
+On a **private** Gitea repo, every giorno job died at checkout:
+
+```
+could not read Username for 'https://git.calii.net': terminal prompts disabled
+```
+
+while speedwagon jobs checked out fine — *not because fucina did anything right*, but
+because its LaunchAgent runs in cali's GUI session, whose keychain happens to hold a
+cached HTTPS credential for git.calii.net. Root on giorno has no keychain, no credential,
+no luck.
+
+Passing `with: token: ${{ secrets.GITHUB_TOKEN }}` to `actions/checkout@v4` changes
+nothing: fucina's reimplemented checkout (`execute_checkout`) performs a bare
+`git clone https://…` and reads **no token, no credential, no `with:` input**.
+
+### Resolution chosen (2026-07-22)
+
+The Gitea instance is LAN-only, so the repo was simply made **public**
+(`PATCH /api/v1/repos/{owner}/{repo} {"private": false}`). Anonymous clone then works
+identically on every runner, and the workflows carry no tokens at all.
+
+This is a policy decision that fits a private LAN forge. It is **not** a substitute for
+real auth support the day a repo must stay private.
+
+### Proper fix (v2 candidate)
+
+`execute_checkout` should authenticate the clone, in order of preference:
+
+1. Use the job's `GITEA/GITHUB_TOKEN` provided in the task context (Gitea issues one per
+   job) — inject it into the clone URL (`https://x-access-token:<token>@host/owner/repo`)
+   or via an ephemeral `GIT_ASKPASS` helper; never write it to disk.
+2. Honor an explicit `with: token:` on the checkout step as an override.
+3. Fall back to the current anonymous clone.
+
+## 3. Bonus gap: workflow-level `env:` is ignored by run steps
+
+A workflow-wide `env: PATH: /opt/homebrew/bin:…` never reached the step shells
+(`npm: command not found` on giorno despite `/opt/homebrew/bin/npm` existing). Workflows
+currently work around it by exporting PATH inline in every step. `build_env`/step-env
+composition should merge workflow- and job-level `env:` maps into each step's
+environment.
