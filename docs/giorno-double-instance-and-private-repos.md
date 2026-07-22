@@ -125,3 +125,25 @@ A workflow-wide `env: PATH: /opt/homebrew/bin:…` never reached the step shells
 currently work around it by exporting PATH inline in every step. `build_env`/step-env
 composition should merge workflow- and job-level `env:` maps into each step's
 environment.
+
+**Correction**: this was already fixed in source before these notes were written —
+commit `7150aaf` folds workflow- and job-level `env:` into every step. What giorno was
+running was the May 29 binary, which predates it. Deploying current HEAD *is* the fix.
+
+---
+
+## Remediation status (2026-07-22, same day)
+
+- **Checkout auth (§2 proper fix)**: implemented in `8ccca8f`, released as **v0.2.9**.
+  Token resolution: `with: token:` → `GITHUB_TOKEN` → `GITEA_TOKEN` → anonymous.
+  Injection via inline credential helper reading the child env — never argv, never disk.
+  Ambient helpers are cleared, so the speedwagon-keychain accident can't mask breakage.
+- **speedwagon-rs**: v0.2.9 deployed (binary swap + LaunchAgent bootstrap), declared and
+  polling.
+- **giorno duplicate (§1)**: Fucina.app instance (pid 1467) killed, "Fucina" login item
+  removed. Only the root LaunchDaemon remains. v0.2.9 binary staged at
+  `/tmp/fucina-0.2.9` (sha256 verified) — root swap + `launchctl kickstart` pending.
+- **giorno logging (§1)**: fucina ≥0.2.9 writes its own log to
+  `$HOME/Library/Logs/Fucina/fucina.log` (the daemon plist sets `HOME=/Users/cali`),
+  ending the dependence on launchd redirection.
+- **Un-pinning capucine** from `runs-on: speedwagon`: pending giorno verification.
