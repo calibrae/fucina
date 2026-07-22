@@ -45,7 +45,12 @@ enum Commands {
         labels: Option<Vec<String>>,
     },
     /// Start the runner daemon
-    Daemon,
+    Daemon {
+        /// Run the plain daemon loop without the macOS menu-bar host.
+        /// Used by the SMAppService LaunchDaemon (no GUI session, no NSApp).
+        #[arg(long)]
+        headless: bool,
+    },
 }
 
 fn default_config_path() -> PathBuf {
@@ -55,7 +60,39 @@ fn default_config_path() -> PathBuf {
             return p;
         }
     }
+    // Root LaunchDaemon (SMAppService) context: launchd sets no usable $HOME.
+    // Fall back to the per-user config scaffold the pkg postinstall created —
+    // first match in sorted order wins (single-admin machines have one).
+    if let Ok(entries) = std::fs::read_dir("/Users") {
+        let mut candidates: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path().join("gitea-runner-rs/config.yaml"))
+            .filter(|p| p.exists())
+            .collect();
+        candidates.sort();
+        if let Some(p) = candidates.into_iter().next() {
+            return p;
+        }
+    }
     PathBuf::from("config.yaml")
+}
+
+/// `/Users/<u>/…/config.yaml` → `/Users/<u>`. Used to give a root daemon a
+/// meaningful $HOME (workflow tools — npm, cargo — need one).
+fn home_from_config_path(config: &std::path::Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut comps = config.components();
+    if comps.next() != Some(Component::RootDir) {
+        return None;
+    }
+    match comps.next()? {
+        Component::Normal(c) if c == "Users" => {}
+        _ => return None,
+    }
+    match comps.next()? {
+        Component::Normal(user) => Some(PathBuf::from("/Users").join(user)),
+        _ => None,
+    }
 }
 
 /// macOS users will want `Open Log` in the menu bar to open a readable file.
@@ -67,6 +104,27 @@ pub fn log_file_path() -> Option<PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // Finder/LaunchServices may pass a -psn_X_Y process-serial-number arg
+    // when launching .app bundles. Strip it before clap sees argv.
+    let args: Vec<String> = std::env::args()
+        .filter(|a| !a.starts_with("-psn_"))
+        .collect();
+    let cli = Cli::parse_from(args);
+
+    let config_path = cli.config.unwrap_or_else(default_config_path);
+
+    // Root LaunchDaemons start with no $HOME (or /var/root). Derive one from
+    // the config's /Users/<u>/ prefix — before logging setup, which writes to
+    // $HOME/Library/Logs — so the daemon logs and workflow tools behave like
+    // the hand-rolled plists that exported HOME explicitly. An explicitly
+    // exported non-root HOME always wins.
+    if let Some(home) = home_from_config_path(&config_path) {
+        match std::env::var("HOME") {
+            Ok(h) if !h.is_empty() && h != "/var/root" => {}
+            _ => std::env::set_var("HOME", &home),
+        }
+    }
+
     // Set up a file appender so the menu-bar Open Log item has something real
     // to open. Leak the guard so logs keep flushing for the program's lifetime.
     let file_guard = if let Some(path) = log_file_path() {
@@ -103,19 +161,11 @@ fn main() -> Result<()> {
     // Keep the guard alive for the life of the process
     std::mem::forget(file_guard);
 
-    // Finder/LaunchServices may pass a -psn_X_Y process-serial-number arg
-    // when launching .app bundles. Strip it before clap sees argv.
-    let args: Vec<String> = std::env::args()
-        .filter(|a| !a.starts_with("-psn_"))
-        .collect();
-    let cli = Cli::parse_from(args);
-
-    let config_path = cli.config.unwrap_or_else(default_config_path);
     let config = config::Config::load(&config_path)
         .with_context(|| format!("loading config from {}", config_path.display()))?;
 
     // Default to daemon if no subcommand (Finder double-click launch).
-    let command = cli.command.unwrap_or(Commands::Daemon);
+    let command = cli.command.unwrap_or(Commands::Daemon { headless: false });
 
     match command {
         Commands::Register {
@@ -131,19 +181,21 @@ fn main() -> Result<()> {
                 labels.as_deref(),
             ))
         }
-        Commands::Daemon => {
-            // macOS: main thread must host NSApplication for LaunchServices
-            // registration + Local Network Privacy prompts. The tokio runtime
-            // and poller run on a worker thread inside macos_menu::run.
+        Commands::Daemon { headless } => {
+            // macOS GUI session: main thread must host NSApplication for
+            // LaunchServices registration + Local Network Privacy prompts. The
+            // tokio runtime and poller run on a worker thread inside
+            // macos_menu::run. Headless (SMAppService root LaunchDaemon, no
+            // GUI session) skips NSApp entirely — Tahoe daemons need neither
+            // the prompt nor the menu bar.
             #[cfg(target_os = "macos")]
-            {
-                macos_menu::run(config)
+            if !headless {
+                return macos_menu::run(config);
             }
             #[cfg(not(target_os = "macos"))]
-            {
-                let rt = tokio::runtime::Runtime::new()?;
-                rt.block_on(cmd_daemon(&config))
-            }
+            let _ = headless;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd_daemon(&config))
         }
     }
 }
@@ -180,7 +232,6 @@ async fn cmd_register(
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
 async fn cmd_daemon(config: &config::Config) -> Result<()> {
     // When running inside the macOS menu-bar host, shutdown signals come
     // from NSApplication::terminate via the worker thread. Otherwise set
@@ -199,7 +250,61 @@ async fn cmd_daemon(config: &config::Config) -> Result<()> {
         let _ = tx.send(true);
     });
 
+    spawn_bundle_version_watcher(shutdown_tx.clone());
+
     run_daemon(config.clone(), shutdown_rx).await
+}
+
+/// Path to the enclosing app bundle's Info.plist, when running from one
+/// (…/Fucina.app/Contents/MacOS/fucina → …/Fucina.app/Contents/Info.plist).
+fn bundle_info_plist() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let macos_dir = exe.parent()?;
+    let contents = macos_dir.parent()?;
+    (macos_dir.file_name()? == "MacOS" && contents.file_name()? == "Contents")
+        .then(|| contents.join("Info.plist"))
+}
+
+/// Extract `CFBundleShortVersionString` from an XML Info.plist. The bundle's
+/// plist is written from a sed'd template, so it is always XML — no need for
+/// a binary-plist parser dependency.
+fn plist_version(xml: &str) -> Option<String> {
+    let key_at = xml.find("<key>CFBundleShortVersionString</key>")?;
+    let rest = &xml[key_at..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let rest = &rest[start..];
+    let end = rest.find("</string>")?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Zero-touch updates: when running from Fucina.app, watch the bundle's
+/// Info.plist. A self-update pkg (or manual reinstall) replaces the bundle
+/// in place; once the version on disk differs from the running one, trigger
+/// a graceful shutdown — the poller drains in-flight jobs, the process exits,
+/// and launchd's KeepAlive restarts it into the new binary. No sudo, ever.
+fn spawn_bundle_version_watcher(tx: tokio::sync::watch::Sender<bool>) {
+    let Some(plist) = bundle_info_plist() else {
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let Ok(xml) = tokio::fs::read_to_string(&plist).await else {
+                continue;
+            };
+            if let Some(v) = plist_version(&xml) {
+                if v != env!("CARGO_PKG_VERSION") {
+                    info!(
+                        "bundle updated to {} (running {}) — draining jobs, restarting via launchd",
+                        v,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                    let _ = tx.send(true);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Core daemon loop without signal-handling wiring — used both by the plain
@@ -297,4 +402,52 @@ pub async fn run_daemon(
 
     info!("daemon stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plist_version_extracts() {
+        let xml = r#"<dict>
+    <key>CFBundleVersion</key>
+    <string>9.9.9</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.3.0</string>
+</dict>"#;
+        assert_eq!(plist_version(xml).as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn plist_version_missing_key() {
+        assert_eq!(plist_version("<dict></dict>"), None);
+        assert_eq!(plist_version(""), None);
+    }
+
+    #[test]
+    fn plist_version_key_order_independent() {
+        // must read the string that FOLLOWS the short-version key, not the
+        // first <string> in the file
+        let xml = "<key>CFBundleVersion</key><string>1.1.1</string>\
+                   <key>CFBundleShortVersionString</key><string>2.2.2</string>";
+        assert_eq!(plist_version(xml).as_deref(), Some("2.2.2"));
+    }
+
+    #[test]
+    fn home_from_config_under_users() {
+        assert_eq!(
+            home_from_config_path(std::path::Path::new(
+                "/Users/cali/gitea-runner-rs/config.yaml"
+            )),
+            Some(PathBuf::from("/Users/cali"))
+        );
+    }
+
+    #[test]
+    fn home_from_config_elsewhere_is_none() {
+        for p in ["/etc/fucina/config.yaml", "config.yaml", "/Users"] {
+            assert_eq!(home_from_config_path(std::path::Path::new(p)), None);
+        }
+    }
 }

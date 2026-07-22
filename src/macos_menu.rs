@@ -33,6 +33,105 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tracing::{error, info};
 
+// Load ServiceManagement.framework so AnyClass::get("SMAppService") resolves.
+// AppKit/Foundation come in via objc2-app-kit; this one we must ask for.
+#[link(name = "ServiceManagement", kind = "framework")]
+extern "C" {}
+
+// ── SMAppService daemon management ────────────────────────────────────────────
+//
+// The app embeds Contents/Library/LaunchDaemons/net.calii.fucina.daemon.plist.
+// "System Daemon…" registers it via SMAppService (macOS 13+): one admin
+// approval in System Settings → Login Items, and macOS runs fucina as a root
+// LaunchDaemon pointing INTO the bundle — so pkg self-updates update the
+// daemon too (it drains and relaunches itself via the version watcher).
+// LaunchDaemon context also sidesteps the Sequoia/Tahoe user-session Local
+// Network Privacy misery documented in JOURNEY.md.
+
+const DAEMON_PLIST_NAME: &str = "net.calii.fucina.daemon.plist";
+
+// SMAppServiceStatus raw values
+const SM_NOT_REGISTERED: isize = 0;
+const SM_ENABLED: isize = 1;
+const SM_REQUIRES_APPROVAL: isize = 2;
+/// Sentinel for "SMAppService class unavailable" (pre-13 macOS).
+const SM_UNAVAILABLE: isize = -1;
+
+fn daemon_service() -> Option<Retained<AnyObject>> {
+    use objc2::runtime::AnyClass;
+    let cls = AnyClass::get("SMAppService")?;
+    let name = NSString::from_str(DAEMON_PLIST_NAME);
+    Some(unsafe { msg_send_id![cls, daemonServiceWithPlistName: &*name] })
+}
+
+fn daemon_status() -> isize {
+    match daemon_service() {
+        Some(svc) => unsafe { msg_send![&svc, status] },
+        None => SM_UNAVAILABLE,
+    }
+}
+
+unsafe fn nserror_string(err: *mut AnyObject) -> String {
+    if err.is_null() {
+        return "unknown error".into();
+    }
+    let desc: Retained<NSString> = msg_send_id![&*err, localizedDescription];
+    desc.to_string()
+}
+
+fn daemon_register() -> Result<(), String> {
+    let svc = daemon_service().ok_or("SMAppService unavailable (macOS 13+ required)")?;
+    unsafe {
+        let mut err: *mut AnyObject = std::ptr::null_mut();
+        let ok: bool = msg_send![&svc, registerAndReturnError: &mut err];
+        if ok {
+            Ok(())
+        } else {
+            Err(nserror_string(err))
+        }
+    }
+}
+
+fn daemon_unregister() -> Result<(), String> {
+    let svc = daemon_service().ok_or("SMAppService unavailable (macOS 13+ required)")?;
+    unsafe {
+        let mut err: *mut AnyObject = std::ptr::null_mut();
+        let ok: bool = msg_send![&svc, unregisterAndReturnError: &mut err];
+        if ok {
+            Ok(())
+        } else {
+            Err(nserror_string(err))
+        }
+    }
+}
+
+fn open_login_items_settings() {
+    use objc2::runtime::AnyClass;
+    if let Some(cls) = AnyClass::get("SMAppService") {
+        unsafe {
+            let _: () = msg_send![cls, openSystemSettingsLoginItems];
+        }
+    }
+}
+
+/// Modal NSAlert with arbitrary buttons. Returns the 0-based index of the
+/// pressed button (0 = first/rightmost), or -1 if NSAlert is unavailable.
+/// Must be called on the main thread.
+unsafe fn run_alert(title: &str, body: &str, buttons: &[&str]) -> isize {
+    use objc2::runtime::AnyClass;
+    let Some(cls) = AnyClass::get("NSAlert") else {
+        return -1;
+    };
+    let alert: Retained<AnyObject> = msg_send_id![cls, new];
+    let _: () = msg_send![&alert, setMessageText: &*NSString::from_str(title)];
+    let _: () = msg_send![&alert, setInformativeText: &*NSString::from_str(body)];
+    for b in buttons {
+        let _: () = msg_send![&alert, addButtonWithTitle: &*NSString::from_str(b)];
+    }
+    let r: isize = msg_send![&alert, runModal];
+    r - 1000 // NSAlertFirstButtonReturn
+}
+
 // ── Self-update ───────────────────────────────────────────────────────────────
 
 static UPDATE_CHECKING: AtomicBool = AtomicBool::new(false);
@@ -148,6 +247,8 @@ pub struct HandlerIvars {
     runner_url: String,
     app_path: String,
     login_item_name: String,
+    /// Stops the in-app runner worker (e.g. when handing off to the daemon).
+    shutdown_tx: watch::Sender<bool>,
 }
 
 declare_class!(
@@ -233,8 +334,109 @@ declare_class!(
             });
         }
 
+        #[method(daemonMenu:)]
+        fn daemon_menu(&self, _sender: Option<&AnyObject>) {
+            unsafe {
+                match daemon_status() {
+                    SM_ENABLED => {
+                        if run_alert(
+                            "System Daemon",
+                            "fucina runs as a root LaunchDaemon managed by macOS.\n\
+                             Pkg self-updates restart it automatically.",
+                            &["Uninstall Daemon", "Cancel"],
+                        ) == 0
+                        {
+                            match daemon_unregister() {
+                                Ok(()) => show_simple_alert(
+                                    "System Daemon",
+                                    "Daemon unregistered. Relaunch Fucina.app to host the \
+                                     runner from the menu bar again.",
+                                ),
+                                Err(e) => show_simple_alert("Uninstall Failed", &e),
+                            }
+                        }
+                    }
+                    SM_REQUIRES_APPROVAL => {
+                        if run_alert(
+                            "System Daemon — Awaiting Approval",
+                            "The daemon is registered but not yet approved.\n\
+                             Enable Fucina under System Settings → General → \
+                             Login Items & Extensions → Allow in the Background.",
+                            &["Open System Settings", "Cancel"],
+                        ) == 0
+                        {
+                            open_login_items_settings();
+                        }
+                    }
+                    SM_UNAVAILABLE => show_simple_alert(
+                        "System Daemon",
+                        "SMAppService is unavailable — macOS 13+ required.",
+                    ),
+                    // notRegistered / notFound
+                    _ => {
+                        if run_alert(
+                            "Install as System Daemon",
+                            "Installs fucina as a root LaunchDaemon managed by macOS: \
+                             survives logout, no Local Network prompt roulette, and pkg \
+                             self-updates restart it automatically.\n\n\
+                             The in-app runner stops and \"Launch at Login\" is removed \
+                             so exactly one instance runs.",
+                            &["Install", "Cancel"],
+                        ) != 0
+                        {
+                            return;
+                        }
+                        match daemon_register() {
+                            Ok(()) => {
+                                // Single-instance guarantees: drop the login item
+                                // and stop the in-app worker.
+                                if login_item_enabled(&self.ivars().login_item_name) {
+                                    set_login_item(&self.ivars().login_item_name, false);
+                                }
+                                let _ = self.ivars().shutdown_tx.send(true);
+                                if daemon_status() == SM_REQUIRES_APPROVAL {
+                                    if run_alert(
+                                        "One More Step",
+                                        "macOS needs your approval: enable Fucina under \
+                                         System Settings → General → Login Items & \
+                                         Extensions → Allow in the Background.",
+                                        &["Open System Settings", "Later"],
+                                    ) == 0
+                                    {
+                                        open_login_items_settings();
+                                    }
+                                } else {
+                                    show_simple_alert(
+                                        "System Daemon",
+                                        "Daemon installed and enabled. The in-app runner \
+                                         has been stopped.",
+                                    );
+                                }
+                            }
+                            Err(e) => show_simple_alert("Install Failed", &e),
+                        }
+                    }
+                }
+            }
+        }
+
         #[method(toggleLogin:)]
         fn toggle_login(&self, sender: Option<&AnyObject>) {
+            // Daemon mode owns the runner — a login item would resurrect the
+            // giorno double-instance bug. Refuse and keep the checkbox off.
+            if daemon_status() == SM_ENABLED {
+                unsafe {
+                    if let Some(sender) = sender {
+                        let _: () = msg_send![sender, setState: STATE_OFF];
+                    }
+                    show_simple_alert(
+                        "Launch at Login",
+                        "The system daemon is active — a login item would start a \
+                         second runner instance. Uninstall the daemon first.",
+                    );
+                }
+                return;
+            }
             let enabled = login_item_enabled(&self.ivars().login_item_name);
             let new_state = !enabled;
             if new_state {
@@ -337,29 +539,44 @@ fn trigger_local_network_prompt(
 pub fn run(config: Config) -> Result<()> {
     let mtm = MainThreadMarker::new().expect("macos_menu::run must be invoked on the main thread");
 
+    // When the SMAppService daemon is enabled, the daemon hosts the runner
+    // and this app is a pure controller (status, logs, install/uninstall) —
+    // spawning a second poller here would recreate the giorno double-instance
+    // lottery. The Local Network dance is also the daemon's problem, not ours.
+    let daemon_active = daemon_status() == SM_ENABLED;
+
     // Fire a Bonjour browse so macOS surfaces the Local Network permission
     // prompt attributed to this bundle (BSD-socket connects don't trigger it).
-    let _ln_browser = trigger_local_network_prompt(mtm);
+    let _ln_browser = if daemon_active {
+        None
+    } else {
+        trigger_local_network_prompt(mtm)
+    };
 
-    // Daemon on worker thread. Wait a few seconds before touching the
-    // network so NSApp has time to register with LaunchServices and any
-    // Local Network Privacy prompt has a chance to surface on a stable
-    // bundle identity.
+    // Runner on worker thread (unless the system daemon owns it). Wait a few
+    // seconds before touching the network so NSApp has time to register with
+    // LaunchServices and any Local Network Privacy prompt has a chance to
+    // surface on a stable bundle identity.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let worker_cfg = config.clone();
-    let worker = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        let rt = match tokio::runtime::Runtime::new() {
-            Ok(rt) => rt,
-            Err(e) => {
-                error!("failed to build tokio runtime: {e:#}");
-                return;
+    let worker = if daemon_active {
+        info!("system daemon active — running as controller only");
+        None
+    } else {
+        let worker_cfg = config.clone();
+        Some(std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    error!("failed to build tokio runtime: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = rt.block_on(crate::run_daemon(worker_cfg, shutdown_rx)) {
+                error!("daemon exited with error: {e:#}");
             }
-        };
-        if let Err(e) = rt.block_on(crate::run_daemon(worker_cfg, shutdown_rx)) {
-            error!("daemon exited with error: {e:#}");
-        }
-    });
+        }))
+    };
 
     // NSApplication
     let app = NSApplication::sharedApplication(mtm);
@@ -375,6 +592,7 @@ pub fn run(config: Config) -> Result<()> {
             runner_url: format!("{}/-/admin/actions/runners", config.instance),
             app_path: "/Applications/Fucina.app".to_string(),
             login_item_name: "Fucina".to_string(),
+            shutdown_tx: shutdown_tx.clone(),
         },
     );
 
@@ -395,8 +613,12 @@ pub fn run(config: Config) -> Result<()> {
 
     let info = NSMenuItem::new(mtm);
     unsafe {
-        let _: () =
-            msg_send![&info, setTitle: &*NSString::from_str(&format!("fucina — {}", config.name))];
+        let title = format!(
+            "fucina — {}{}",
+            config.name,
+            if daemon_active { " (daemon mode)" } else { "" }
+        );
+        let _: () = msg_send![&info, setTitle: &*NSString::from_str(&title)];
         let _: () = msg_send![&info, setEnabled: false];
     }
     menu.addItem(&info);
@@ -430,8 +652,16 @@ pub fn run(config: Config) -> Result<()> {
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+    add_item(
+        mtm,
+        &menu,
+        "System Daemon\u{2026}",
+        sel!(daemonMenu:),
+        &handler,
+    );
+
     let login_item = add_item(mtm, &menu, "Launch at Login", sel!(toggleLogin:), &handler);
-    if login_item_enabled(&handler.ivars().login_item_name) {
+    if !daemon_active && login_item_enabled(&handler.ivars().login_item_name) {
         unsafe {
             let _: () = msg_send![&login_item, setState: STATE_ON];
         }
@@ -458,8 +688,10 @@ pub fn run(config: Config) -> Result<()> {
     unsafe { app.run() };
 
     let _ = shutdown_tx.send(true);
-    info!("waiting for worker to drain...");
-    let _ = worker.join();
+    if let Some(worker) = worker {
+        info!("waiting for worker to drain...");
+        let _ = worker.join();
+    }
     Ok(())
 }
 

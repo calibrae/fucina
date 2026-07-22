@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- SMAppService daemon: registered from the menu bar ("System Daemon…").
+         BundleProgram points INTO Fucina.app, so replacing the bundle (pkg
+         self-update) updates the daemon; the running daemon notices the
+         version change, drains, and lets KeepAlive relaunch it.
+         No user paths here: fucina resolves config.yaml itself (scans
+         /Users/<u>/gitea-runner-rs/ when $HOME is unset) and derives $HOME
+         from wherever it found the config. -->
+    <key>Label</key>
+    <string>net.calii.fucina.daemon</string>
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/fucina</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>fucina</string>
+        <string>daemon</string>
+        <string>--headless</string>
+    </array>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>net.calii.fucina.app</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

@@ -40,6 +40,8 @@ bundle: release
 	chmod 755 $(APP_BUNDLE)/Contents/MacOS/$(BINARY)
 	cp bundle/Fucina.icns $(APP_BUNDLE)/Contents/Resources/Fucina.icns
 	sed "s/__VERSION__/$(VERSION)/g" bundle/Info.plist.template > $(APP_BUNDLE)/Contents/Info.plist
+	mkdir -p $(APP_BUNDLE)/Contents/Library/LaunchDaemons
+	cp bundle/net.calii.fucina.daemon.plist $(APP_BUNDLE)/Contents/Library/LaunchDaemons/
 	codesign --force --options runtime --timestamp \
 		--sign "$(APP_SIGN)" \
 		--identifier "$(IDENTIFIER)" \
