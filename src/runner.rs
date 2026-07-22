@@ -921,6 +921,46 @@ async fn execute_uses_step(
     Ok(proto::TaskResult::Skipped)
 }
 
+/// Resolve the auth token for checkout. An explicit `with: token:` wins,
+/// then the job's `GITHUB_TOKEN`/`GITEA_TOKEN` (Gitea issues one per job,
+/// present in the step env via secrets and the github context), else None
+/// → anonymous clone.
+fn resolve_checkout_token(
+    with: &HashMap<String, String>,
+    env_vars: &HashMap<String, String>,
+) -> Option<String> {
+    [
+        with.get("token"),
+        env_vars.get("GITHUB_TOKEN"),
+        env_vars.get("GITEA_TOKEN"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|s| !s.is_empty())
+    .cloned()
+}
+
+/// A `git` command that authenticates via an inline credential helper reading
+/// the token from the child's environment. The token never appears in argv
+/// (visible in `ps`) and never touches disk — the remote URL stored in
+/// `.git/config` stays clean. The first empty `credential.helper=` clears any
+/// ambient helpers (e.g. the macOS keychain, which made anonymous clones
+/// "work" on speedwagon by accident) so behaviour is identical on every host.
+fn git_cmd(token: Option<&str>) -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(token) = token {
+        c.args([
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.helper=!f() { echo username=x-access-token; echo \"password=${FUCINA_GIT_TOKEN}\"; }; f",
+        ]);
+        c.env("FUCINA_GIT_TOKEN", token);
+    }
+    c
+}
+
 async fn execute_checkout(
     job_dir: &Path,
     env_vars: &HashMap<String, String>,
@@ -954,8 +994,18 @@ async fn execute_checkout(
 
     let repo_url = build_repo_url(server_url, repository);
     let workspace = job_dir.join("workspace");
+    let token = resolve_checkout_token(with, env_vars);
     reporter
-        .logf(format!("Cloning {} (ref {})", repo_url, ref_name))
+        .logf(format!(
+            "Cloning {} (ref {}, auth: {})",
+            repo_url,
+            ref_name,
+            if token.is_some() {
+                "token"
+            } else {
+                "anonymous"
+            }
+        ))
         .await;
 
     // Clone the default branch shallow, then resolve the requested ref
@@ -963,7 +1013,7 @@ async fn execute_checkout(
     // ref-type-agnostic — it handles branches (refs/heads/…), tags
     // (refs/tags/…) and raw SHAs uniformly. `git clone --branch` only
     // accepts a *short* branch/tag name and chokes on full ref paths.
-    let clone = Command::new("git")
+    let clone = git_cmd(token.as_deref())
         .args(["clone", "--depth", "1"])
         .arg(&repo_url)
         .arg(&workspace)
@@ -975,7 +1025,7 @@ async fn execute_checkout(
         return Ok(proto::TaskResult::Failure);
     }
 
-    let fetch = Command::new("git")
+    let fetch = git_cmd(token.as_deref())
         .args(["fetch", "--depth", "1", "origin"])
         .arg(ref_name)
         .current_dir(&workspace)
@@ -1598,6 +1648,73 @@ outputs:
         let v = needs_to_json(&needs);
         assert_eq!(v["compile"]["outputs"]["artifact"], json!("out.tar"));
         assert_eq!(v["compile"]["result"], json!("success"));
+    }
+
+    // --- resolve_checkout_token ---
+
+    #[test]
+    fn checkout_token_with_overrides_env() {
+        let with = HashMap::from([("token".to_string(), "with-tok".to_string())]);
+        let env = HashMap::from([("GITHUB_TOKEN".to_string(), "env-tok".to_string())]);
+        assert_eq!(
+            resolve_checkout_token(&with, &env).as_deref(),
+            Some("with-tok")
+        );
+    }
+
+    #[test]
+    fn checkout_token_empty_with_falls_through() {
+        // `with: token: ''` (e.g. an unresolved expression) must not shadow
+        // the job token
+        let with = HashMap::from([("token".to_string(), String::new())]);
+        let env = HashMap::from([("GITHUB_TOKEN".to_string(), "env-tok".to_string())]);
+        assert_eq!(
+            resolve_checkout_token(&with, &env).as_deref(),
+            Some("env-tok")
+        );
+    }
+
+    #[test]
+    fn checkout_token_gitea_fallback() {
+        let with = HashMap::new();
+        let env = HashMap::from([("GITEA_TOKEN".to_string(), "gitea-tok".to_string())]);
+        assert_eq!(
+            resolve_checkout_token(&with, &env).as_deref(),
+            Some("gitea-tok")
+        );
+    }
+
+    #[test]
+    fn checkout_token_none_is_anonymous() {
+        assert_eq!(
+            resolve_checkout_token(&HashMap::new(), &HashMap::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn git_cmd_keeps_token_out_of_argv() {
+        let cmd = git_cmd(Some("s3cr3t"));
+        let std = cmd.as_std();
+        for arg in std.get_args() {
+            assert!(
+                !arg.to_string_lossy().contains("s3cr3t"),
+                "token leaked into argv: {:?}",
+                arg
+            );
+        }
+        // token flows via the child env instead
+        assert!(std
+            .get_envs()
+            .any(|(k, v)| k == "FUCINA_GIT_TOKEN" && v.map(|v| v == "s3cr3t").unwrap_or(false)));
+    }
+
+    #[test]
+    fn git_cmd_anonymous_has_no_helper() {
+        let cmd = git_cmd(None);
+        let std = cmd.as_std();
+        assert_eq!(std.get_args().count(), 0);
+        assert!(std.get_envs().all(|(k, _)| k != "FUCINA_GIT_TOKEN"));
     }
 
     // --- build_repo_url ---
