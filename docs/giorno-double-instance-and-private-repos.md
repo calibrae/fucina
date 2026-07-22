@@ -147,3 +147,16 @@ running was the May 29 binary, which predates it. Deploying current HEAD *is* th
   `$HOME/Library/Logs/Fucina/fucina.log` (the daemon plist sets `HOME=/Users/cali`),
   ending the dependence on launchd redirection.
 - **Un-pinning capucine** from `runs-on: speedwagon`: pending giorno verification.
+
+## Post-deploy note (2026-07-22, evening) — v0.2.9 fallout on speedwagon
+
+First real run after the v0.2.9 rollout: backend job failed at checkout on speedwagon with
+`fatal: detected dubious ownership in repository at …/work/task-N/workspace`. The clone
+succeeds, but the follow-up git invocation runs with the cleaned environment introduced by
+the credential-helper work — and without the ambient config, git's ownership check goes
+strict. giorno was unaffected. Unblocked host-side with
+`git config --global --add safe.directory '*'` for the runner user (standard practice for
+self-hosted runners). Proper fucina fix: pass `-c safe.directory=<workspace>` (or
+`GIT_CONFIG_COUNT` equivalents) on every git invocation of `execute_checkout`, so the
+runner never depends on host git config. Verified green cluster-wide afterwards
+(run 561: backend on speedwagon-rs, both fronts on giorno-rs).
