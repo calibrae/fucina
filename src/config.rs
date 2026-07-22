@@ -71,7 +71,30 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config: {}", path.display()))?;
-        serde_yaml::from_str(&content).context("failed to parse config")
+        let mut config: Config =
+            serde_yaml::from_str(&content).context("failed to parse config")?;
+        config.resolve_relative_paths(path);
+        Ok(config)
+    }
+
+    /// Anchor relative `runner_file`/`work_dir` to the config file's directory,
+    /// not the process cwd. Under a LaunchAgent the cwd was set via
+    /// `WorkingDirectory`; the SMAppService daemon plist intentionally carries
+    /// no user paths, so its cwd is `/` — a bare `runner_file: .runner` would
+    /// resolve to `/.runner` and the daemon would crash-loop on "no runner
+    /// credentials". The `.runner` sits next to `config.yaml` by convention
+    /// (TaskStateFile::alongside already assumes this), so the config's own
+    /// directory is the right anchor.
+    fn resolve_relative_paths(&mut self, config_path: &Path) {
+        let Some(dir) = config_path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+            return;
+        };
+        if self.runner_file.is_relative() {
+            self.runner_file = dir.join(&self.runner_file);
+        }
+        if self.work_dir.is_relative() {
+            self.work_dir = dir.join(&self.work_dir);
+        }
     }
 
     pub fn api_base(&self) -> String {
@@ -206,6 +229,42 @@ runner_file: /etc/runner/.runner
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.instance, "https://example.com");
         assert_eq!(cfg.capacity, 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_anchors_default_runner_file_to_config_dir() {
+        // A config that sets no runner_file must not leave it as a bare
+        // relative ".runner" — under the SMAppService daemon (cwd=/) that
+        // would look for /.runner and crash-loop. It anchors next to the
+        // config instead.
+        let dir = std::env::temp_dir().join("act-runner-test-anchor");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "instance: https://example.com\n").unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.runner_file, dir.join(".runner"));
+        assert!(cfg.runner_file.is_absolute());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_keeps_absolute_paths() {
+        let dir = std::env::temp_dir().join("act-runner-test-abs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "instance: https://example.com\nrunner_file: /etc/fucina/.runner\nwork_dir: /var/fucina\n",
+        )
+        .unwrap();
+
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.runner_file, PathBuf::from("/etc/fucina/.runner"));
+        assert_eq!(cfg.work_dir, PathBuf::from("/var/fucina"));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
