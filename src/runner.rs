@@ -245,7 +245,7 @@ pub async fn execute(
                 .await
             } else if let Some(uses) = &step.uses {
                 let with = render_map(&step.with, &ctx);
-                execute_uses_step(uses, &job_dir, &step_env, &with, &reporter).await
+                execute_uses_step(uses, &job_dir, &step_env, &with, run_as, &reporter).await
             } else {
                 reporter.log("Step has no 'run' or 'uses' — skipping").await;
                 Ok(proto::TaskResult::Skipped)
@@ -905,11 +905,12 @@ async fn execute_uses_step(
     job_dir: &Path,
     env_vars: &HashMap<String, String>,
     with: &HashMap<String, String>,
+    run_as: Option<&str>,
     reporter: &Reporter,
 ) -> Result<proto::TaskResult> {
     // Basic support for common actions
     if uses.starts_with("actions/checkout") {
-        return execute_checkout(job_dir, env_vars, with, reporter).await;
+        return execute_checkout(job_dir, env_vars, with, run_as, reporter).await;
     }
 
     reporter
@@ -965,6 +966,7 @@ async fn execute_checkout(
     job_dir: &Path,
     env_vars: &HashMap<String, String>,
     with: &HashMap<String, String>,
+    run_as: Option<&str>,
     reporter: &Reporter,
 ) -> Result<proto::TaskResult> {
     let server_url = env_vars
@@ -1044,11 +1046,22 @@ async fn execute_checkout(
         .await
         .context("git checkout failed")?;
     log_command_output(reporter, &checkout).await;
-    if checkout.status.success() {
-        Ok(proto::TaskResult::Success)
-    } else {
-        Ok(proto::TaskResult::Failure)
+    if !checkout.status.success() {
+        return Ok(proto::TaskResult::Failure);
     }
+
+    // The clone ran as the daemon user (root under the SMAppService daemon).
+    // With run_as set, later steps run as that user via sudo and must be able
+    // to write into the checkout (target/, node_modules/, …) — hand it over.
+    if let Some(user) = run_as {
+        let _ = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{}:staff", user))
+            .arg(&workspace)
+            .status()
+            .await;
+    }
+    Ok(proto::TaskResult::Success)
 }
 
 /// Build the clone URL. `GITHUB_SERVER_URL` arrives with a trailing slash,
