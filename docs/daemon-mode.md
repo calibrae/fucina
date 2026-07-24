@@ -51,8 +51,20 @@ The embedded plist contains **no user paths**. A root daemon has no usable
    non-root `HOME` always wins.
 
 Jobs run as root unless `run_as: <user>` is set in config.yaml — set it on
-machines where that matters (the `sudo -u` + chown plumbing has existed since
-the giorno root daemon).
+machines where that matters (the `sudo -u` plumbing has existed since the
+giorno root daemon).
+
+**Privilege drop (v0.4.0+).** With `run_as` set, the root daemon is a pure
+supervisor: it polls, parses YAML, and spawns every step — *including the
+`actions/checkout` git clone/fetch/checkout* — as the `run_as` user via
+`sudo -u`. No workflow code runs as root. Point `run_as` at a dedicated
+unprivileged user (a `ci` account), not a person, so a malicious job is boxed
+to that account rather than root or your login. The one thing that forces
+`run_as: <login-user>` is a step needing **Docker Desktop**, whose socket is
+bound to the GUI-session user (`/Users/<u>/.docker/run/docker.sock`) and is
+unreachable by a separate service account — Testcontainers jobs must run as
+whoever runs Docker. The checkout token still rides through the environment
+(`--preserve-env`), never argv, when git is dropped to `run_as`.
 
 ## Migrating a hand-rolled daemon (giorno, speedwagon)
 

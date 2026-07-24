@@ -941,22 +941,56 @@ fn resolve_checkout_token(
     .cloned()
 }
 
-/// A `git` command that authenticates via an inline credential helper reading
-/// the token from the child's environment. The token never appears in argv
-/// (visible in `ps`) and never touches disk — the remote URL stored in
-/// `.git/config` stays clean. The first empty `credential.helper=` clears any
-/// ambient helpers (e.g. the macOS keychain, which made anonymous clones
-/// "work" on speedwagon by accident) so behaviour is identical on every host.
-fn git_cmd(token: Option<&str>) -> Command {
-    let mut c = Command::new("git");
-    c.env("GIT_TERMINAL_PROMPT", "0");
-    if let Some(token) = token {
-        c.args([
+/// A `git` command, optionally dropped to `run_as` and optionally
+/// authenticated.
+///
+/// Auth: an inline credential helper reads the token from the child's
+/// environment — the token never appears in argv (visible in `ps`) and never
+/// touches disk, so the remote URL in `.git/config` stays clean. The first
+/// empty `credential.helper=` clears any ambient helpers (e.g. the macOS
+/// keychain, which made anonymous clones "work" on speedwagon by accident) so
+/// behaviour is identical on every host.
+///
+/// Privilege: when `run_as` is set the git process runs as that user via
+/// `sudo -u` — the same unprivileged user the steps run as. So checkout never
+/// touches the filesystem as the root daemon, and the repo it produces is
+/// owned by the user that later steps run as (no cross-user "dubious ownership"
+/// or unwritable-`node_modules` surprises). The token rides through
+/// `--preserve-env` — a named passthrough, never argv — instead of sudo's
+/// default env scrub.
+fn git_cmd(token: Option<&str>, run_as: Option<&str>) -> Command {
+    // Credential-helper flags, emitted right after `git`.
+    let mut cred: Vec<&str> = Vec::new();
+    if token.is_some() {
+        cred.extend_from_slice(&[
             "-c",
             "credential.helper=",
             "-c",
             "credential.helper=!f() { echo username=x-access-token; echo \"password=${FUCINA_GIT_TOKEN}\"; }; f",
         ]);
+    }
+
+    let mut c = match run_as {
+        Some(user) => {
+            let mut c = Command::new("sudo");
+            c.args(["-u", user, "-H"]);
+            c.arg(if token.is_some() {
+                "--preserve-env=FUCINA_GIT_TOKEN,GIT_TERMINAL_PROMPT"
+            } else {
+                "--preserve-env=GIT_TERMINAL_PROMPT"
+            });
+            c.arg("--").arg("git");
+            c.args(&cred);
+            c
+        }
+        None => {
+            let mut c = Command::new("git");
+            c.args(&cred);
+            c
+        }
+    };
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(token) = token {
         c.env("FUCINA_GIT_TOKEN", token);
     }
     c
@@ -1015,7 +1049,11 @@ async fn execute_checkout(
     // ref-type-agnostic — it handles branches (refs/heads/…), tags
     // (refs/tags/…) and raw SHAs uniformly. `git clone --branch` only
     // accepts a *short* branch/tag name and chokes on full ref paths.
-    let clone = git_cmd(token.as_deref())
+    // All three git invocations run as `run_as` (when set), so the checkout is
+    // produced and owned by the user the steps run as. `execute()` has already
+    // chowned the job dir to that user, so the pre-created `workspace/` is
+    // writable by the clone.
+    let clone = git_cmd(token.as_deref(), run_as)
         .args(["clone", "--depth", "1"])
         .arg(&repo_url)
         .arg(&workspace)
@@ -1027,7 +1065,7 @@ async fn execute_checkout(
         return Ok(proto::TaskResult::Failure);
     }
 
-    let fetch = git_cmd(token.as_deref())
+    let fetch = git_cmd(token.as_deref(), run_as)
         .args(["fetch", "--depth", "1", "origin"])
         .arg(ref_name)
         .current_dir(&workspace)
@@ -1039,7 +1077,9 @@ async fn execute_checkout(
         return Ok(proto::TaskResult::Failure);
     }
 
-    let checkout = Command::new("git")
+    // Local checkout needs no token, but MUST run as the same user — running it
+    // as root against a run_as-owned repo would trip git's dubious-ownership guard.
+    let checkout = git_cmd(None, run_as)
         .args(["checkout", "FETCH_HEAD"])
         .current_dir(&workspace)
         .output()
@@ -1050,17 +1090,6 @@ async fn execute_checkout(
         return Ok(proto::TaskResult::Failure);
     }
 
-    // The clone ran as the daemon user (root under the SMAppService daemon).
-    // With run_as set, later steps run as that user via sudo and must be able
-    // to write into the checkout (target/, node_modules/, …) — hand it over.
-    if let Some(user) = run_as {
-        let _ = Command::new("chown")
-            .arg("-R")
-            .arg(format!("{}:staff", user))
-            .arg(&workspace)
-            .status()
-            .await;
-    }
     Ok(proto::TaskResult::Success)
 }
 
@@ -1707,8 +1736,9 @@ outputs:
 
     #[test]
     fn git_cmd_keeps_token_out_of_argv() {
-        let cmd = git_cmd(Some("s3cr3t"));
+        let cmd = git_cmd(Some("s3cr3t"), None);
         let std = cmd.as_std();
+        assert_eq!(std.get_program(), "git");
         for arg in std.get_args() {
             assert!(
                 !arg.to_string_lossy().contains("s3cr3t"),
@@ -1724,10 +1754,51 @@ outputs:
 
     #[test]
     fn git_cmd_anonymous_has_no_helper() {
-        let cmd = git_cmd(None);
+        let cmd = git_cmd(None, None);
         let std = cmd.as_std();
+        assert_eq!(std.get_program(), "git");
         assert_eq!(std.get_args().count(), 0);
         assert!(std.get_envs().all(|(k, _)| k != "FUCINA_GIT_TOKEN"));
+    }
+
+    #[test]
+    fn git_cmd_run_as_wraps_sudo() {
+        let cmd = git_cmd(None, Some("ci"));
+        let std = cmd.as_std();
+        assert_eq!(std.get_program(), "sudo");
+        let args: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // drops to ci, sets its HOME, then runs git
+        assert_eq!(
+            &args[..4],
+            &["-u", "ci", "-H", "--preserve-env=GIT_TERMINAL_PROMPT"]
+        );
+        assert_eq!(args[4], "--");
+        assert_eq!(args[5], "git");
+        assert!(std.get_envs().all(|(k, _)| k != "FUCINA_GIT_TOKEN"));
+    }
+
+    #[test]
+    fn git_cmd_run_as_with_token_keeps_token_out_of_argv() {
+        let cmd = git_cmd(Some("s3cr3t"), Some("ci"));
+        let std = cmd.as_std();
+        assert_eq!(std.get_program(), "sudo");
+        for arg in std.get_args() {
+            assert!(
+                !arg.to_string_lossy().contains("s3cr3t"),
+                "token leaked into argv: {:?}",
+                arg
+            );
+        }
+        // token named in the sudo passthrough; value lives only in the env
+        assert!(std
+            .get_args()
+            .any(|a| a.to_string_lossy() == "--preserve-env=FUCINA_GIT_TOKEN,GIT_TERMINAL_PROMPT"));
+        assert!(std
+            .get_envs()
+            .any(|(k, v)| k == "FUCINA_GIT_TOKEN" && v.map(|v| v == "s3cr3t").unwrap_or(false)));
     }
 
     // --- build_repo_url ---
