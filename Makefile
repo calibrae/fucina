@@ -70,9 +70,18 @@ pkg: bundle
 		--identifier $(PKG_IDENTIFIER) \
 		--version $(VERSION) \
 		--install-location / \
+		--component-plist bundle/component.plist \
 		--scripts bundle/scripts \
 		--sign "$(PKG_SIGN)" \
 		$(PKG)
+	@echo "==> verifying relocation is disabled"
+	@rm -rf target/pkg-verify && pkgutil --expand $(PKG) target/pkg-verify
+	@if grep -q "<relocate>" target/pkg-verify/PackageInfo; then \
+		echo "ERROR: pkg still declares <relocate> — it would install over an existing bundle"; \
+		rm -rf target/pkg-verify; exit 1; \
+	fi
+	@rm -rf target/pkg-verify
+	@echo "==> relocation disabled, install-location is authoritative"
 	xcrun notarytool submit $(PKG) \
 		--keychain-profile $(NOTARY_PROFILE) --wait
 	xcrun stapler staple $(PKG)

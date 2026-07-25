@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  pkgbuild component properties.
+
+  BundleIsRelocatable=false is the load-bearing one. By default pkgbuild emits
+  a <relocate> block for every app bundle, which makes installd look up the
+  bundle id (net.calii.fucina.app) via LaunchServices and install ON TOP of
+  whatever copy it finds — ignoring install-location. On any machine that has
+  ever built fucina, that copy is the repo's target/Fucina.app, so the pkg
+  silently installed into ~/Developer/... instead of /Applications and the
+  postinstall then failed to open /Applications/Fucina.app. Observed live on
+  speedwagon (install.log: "Applications/Fucina.app relocated to
+  Users/cali/Developer/perso/fucina/target/Fucina.app"); giorno was unaffected
+  only because it has no checkout. Pinning relocation off makes the install
+  location deterministic everywhere.
+-->
+<plist version="1.0">
+<array>
+	<dict>
+		<key>BundleHasStrictIdentifier</key>
+		<true/>
+		<key>BundleIsRelocatable</key>
+		<false/>
+		<key>BundleIsVersionChecked</key>
+		<false/>
+		<key>BundleOverwriteAction</key>
+		<string>upgrade</string>
+		<key>RootRelativeBundlePath</key>
+		<string>Applications/Fucina.app</string>
+	</dict>
+</array>
+</plist>
