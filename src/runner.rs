@@ -86,9 +86,12 @@ pub async fn execute(
         if !should_run_job(job.get("if"), &job_ctx) {
             let cond = job.get("if").and_then(|v| v.as_str()).unwrap_or("");
             info!("job skipped — `if` condition not satisfied: {}", cond);
-            reporter
+            if let Err(e) = reporter
                 .report_completed(proto::TaskResult::Skipped, vec![], HashMap::new())
-                .await?;
+                .await
+            {
+                error!("job skipped but reporting it to Gitea failed: {:#}", e);
+            }
             return Ok(proto::TaskResult::Skipped);
         }
     }
@@ -148,7 +151,11 @@ pub async fn execute(
     // Step outputs, keyed by step id, feed the `steps.*` context.
     let mut steps_json = serde_json::Map::new();
 
-    reporter.report_started().await?;
+    // Same principle: a hiccup announcing the start must not abort a task we
+    // have already claimed. Run it and report the verdict at the end.
+    if let Err(e) = reporter.report_started().await {
+        warn!("failed to report task start: {:#} — running anyway", e);
+    }
 
     let mut step_states = Vec::new();
     let mut overall_result = proto::TaskResult::Success;
@@ -315,9 +322,20 @@ pub async fn execute(
         warn!("failed to clean up job dir: {}", e);
     }
 
-    reporter
+    // The job's verdict is decided; reporting it is a separate concern. If the
+    // report ultimately fails (after retries) we log loudly but still return
+    // the real result — propagating here would make the poller's catch-all
+    // overwrite a successful job with FAILURE, which is exactly the
+    // mis-reporting bug this guards against.
+    if let Err(e) = reporter
         .report_completed(overall_result, step_states, job_outputs)
-        .await?;
+        .await
+    {
+        error!(
+            "task finished as {:?} but reporting it to Gitea failed: {:#}",
+            overall_result, e
+        );
+    }
 
     Ok(overall_result)
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fucina"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Gitea Actions runner in Rust"
 license = "MIT"
@@ -50,3 +50,9 @@ objc2-app-kit = { version = "0.2", features = [
 strip = true
 lto = true
 codegen-units = 1
+
+[dev-dependencies]
+# test-util is deliberately excluded from tokio's "full" feature; it gives
+# #[tokio::test(start_paused = true)] a virtual clock so the reporter's
+# retry-backoff tests run instantly instead of really sleeping ~7s.
+tokio = { version = "1", features = ["full", "test-util"] }
