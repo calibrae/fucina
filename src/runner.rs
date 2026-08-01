@@ -317,10 +317,26 @@ pub async fn execute(
         info!("job produced {} output(s)", job_outputs.len());
     }
 
-    // Clean up job directory
-    if let Err(e) = tokio::fs::remove_dir_all(&job_dir).await {
-        warn!("failed to clean up job dir: {}", e);
-    }
+    // --- Finalization ----------------------------------------------------
+    // Order is load-bearing: REPORT FIRST, clean up afterwards.
+    //
+    // Cleanup used to run here, before the report. Deleting a job dir (Maven
+    // `target/`, `node_modules/` — tens of thousands of small files) on an
+    // IO-starved host takes minutes, and fucina sends Gitea nothing while it
+    // does. Past Gitea's ZOMBIE_TASK_TIMEOUT (10m by default) the task is
+    // reaped as dead and marked FAILED, so a job whose every step exited 0
+    // came back red with its log truncated at the last `::endgroup::` — the
+    // last thing flushed before the silence. Observed on capucine 2026-07-31:
+    // three jobs, 718-832s each, that take 11-17s on a quiet host.
+    //
+    // The verdict now goes out immediately after the last step, so a slow
+    // delete can no longer cost a task its result.
+    reporter
+        .logf(format!(
+            "Finalizing job — reporting {} to Gitea",
+            result_str(overall_result)
+        ))
+        .await;
 
     // The job's verdict is decided; reporting it is a separate concern. If the
     // report ultimately fails (after retries) we log loudly but still return
@@ -336,6 +352,27 @@ pub async fn execute(
             overall_result, e
         );
     }
+
+    // Detached so a multi-minute delete neither delays the verdict nor holds
+    // the worker slot (the poller's semaphore permit is released when this
+    // function returns). Each task owns `task-<id>/`, so nothing races.
+    let cleanup_dir = job_dir.clone();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        match tokio::fs::remove_dir_all(&cleanup_dir).await {
+            Ok(()) => info!(
+                "cleaned up {} in {:.1}s",
+                cleanup_dir.display(),
+                started.elapsed().as_secs_f32()
+            ),
+            Err(e) => warn!(
+                "failed to clean up job dir {} after {:.1}s: {}",
+                cleanup_dir.display(),
+                started.elapsed().as_secs_f32(),
+                e
+            ),
+        }
+    });
 
     Ok(overall_result)
 }
