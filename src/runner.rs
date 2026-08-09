@@ -116,7 +116,25 @@ pub async fn execute(
 
     // --- Environment & expression context -------------------------------
     // Base env: CI vars + GITHUB_*/RUNNER_* derived from the task context.
-    let base_env = build_env(task, &workspace, &runner_temp);
+    let mut base_env = build_env(task, &workspace, &runner_temp);
+
+    // Surface the execution context, in the log and to the steps themselves.
+    // A job that needs the login keychain (codesign, signing certs) cannot use
+    // it when session=headless, and the resulting error never says so — see
+    // `session_kind`. One line here turns an afternoon of guessing into a
+    // glance, and `$FUCINA_SESSION` lets a build script branch (import a
+    // throwaway keychain) instead of failing.
+    let session = session_kind(run_as);
+    info!(
+        "job context: run_as={} session={} (steps {} reach the login keychain)",
+        run_as.unwrap_or("<daemon user>"),
+        session,
+        if session == "gui" { "can" } else { "CANNOT" }
+    );
+    base_env.insert("FUCINA_SESSION".to_string(), session.to_string());
+    if let Some(user) = run_as {
+        base_env.insert("FUCINA_RUN_AS".to_string(), user.to_string());
+    }
 
     // Job-level / workflow-level env blocks (Gap 3). Precedence is
     // workflow < job < step; we fold workflow then job into `merged_env`
@@ -474,6 +492,30 @@ fn parse_string_map(val: Option<&serde_yaml::Value>) -> HashMap<String, String> 
         }
     }
     map
+}
+
+/// Whether steps will have a macOS GUI (Aqua) session, and therefore access to
+/// ambient session credentials — above all the **login keychain**.
+///
+/// This is the single most common "works on my machine, fails in CI" trap on a
+/// macOS runner. Signing an app, reading a keychain secret, or anything that
+/// quietly relies on the user's logged-in session works from a terminal and
+/// fails from a job, with an error (`errSecInternalComponent`, "cannot write to
+/// keychain") that names none of the above.
+///
+/// `sudo -u` changes the uid but does **not** join the target user's Aqua
+/// session, so a root daemon dropping to `run_as` is always headless — no
+/// matter who is logged in. An empty `SECURITYSESSIONID` means the same for
+/// fucina's own process.
+fn session_kind(run_as: Option<&str>) -> &'static str {
+    let has_security_session = std::env::var("SECURITYSESSIONID")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    match (has_security_session, run_as) {
+        // Only an in-session process that does NOT re-enter via sudo keeps it.
+        (true, None) => "gui",
+        _ => "headless",
+    }
 }
 
 /// `RUNNER_OS` value for the host fucina runs on.
@@ -1745,6 +1787,36 @@ outputs:
         let v = needs_to_json(&needs);
         assert_eq!(v["compile"]["outputs"]["artifact"], json!("out.tar"));
         assert_eq!(v["compile"]["result"], json!("success"));
+    }
+
+    // --- session_kind ---
+
+    #[test]
+    fn session_kind_run_as_is_always_headless() {
+        // sudo -u changes uid but never joins the Aqua session, so a job that
+        // drops privilege can never reach the login keychain — regardless of
+        // who is logged in on the host.
+        assert_eq!(session_kind(Some("ci")), "headless");
+        assert_eq!(session_kind(Some("cali")), "headless");
+    }
+
+    #[test]
+    fn session_kind_without_security_session_is_headless() {
+        // A root LaunchDaemon has no SECURITYSESSIONID.
+        let restore = std::env::var("SECURITYSESSIONID").ok();
+        std::env::remove_var("SECURITYSESSIONID");
+        assert_eq!(session_kind(None), "headless");
+        std::env::set_var("SECURITYSESSIONID", "");
+        assert_eq!(
+            session_kind(None),
+            "headless",
+            "empty value is not a session"
+        );
+        if let Some(v) = restore {
+            std::env::set_var("SECURITYSESSIONID", v);
+        } else {
+            std::env::remove_var("SECURITYSESSIONID");
+        }
     }
 
     // --- resolve_checkout_token ---
