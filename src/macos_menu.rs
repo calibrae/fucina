@@ -50,8 +50,9 @@ extern "C" {}
 
 const DAEMON_PLIST_NAME: &str = "net.calii.fucina.daemon.plist";
 
-// SMAppServiceStatus raw values
-const SM_NOT_REGISTERED: isize = 0;
+// SMAppServiceStatus raw values. notRegistered (0) and notFound (3) are not
+// named: both mean "no daemon installed", and both fall through to the install
+// path's catch-all arm.
 const SM_ENABLED: isize = 1;
 const SM_REQUIRES_APPROVAL: isize = 2;
 /// Sentinel for "SMAppService class unavailable" (pre-13 macOS).

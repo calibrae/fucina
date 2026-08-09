@@ -13,7 +13,18 @@ PKG_ROOT = target/pkg-root
 PKG = target/$(BINARY)-$(VERSION).pkg
 APP_BUNDLE = target/Fucina.app
 
-.PHONY: build release sign bundle notarize pkg pkg-sign pkg-notarize pkg-staple dist clean
+.PHONY: build release sign bundle notarize pkg pkg-sign pkg-notarize pkg-staple dist clean ci
+
+# Exactly what .github/workflows/ci.yml runs, with the same RUSTFLAGS.
+# Plain `cargo test` does NOT set -D warnings, so it happily passes on code CI
+# rejects — a dead-code warning kept CI red across four releases before anyone
+# noticed, because the Release workflow builds without -D warnings and is the
+# one people watch. Run this before pushing.
+ci:
+	RUSTFLAGS="-D warnings" cargo fmt --all -- --check
+	RUSTFLAGS="-D warnings" cargo clippy --all-targets -- -D warnings
+	RUSTFLAGS="-D warnings" cargo test --all-features
+	@echo "==> fmt + clippy + tests pass at CI's bar"
 
 build:
 	cargo build
