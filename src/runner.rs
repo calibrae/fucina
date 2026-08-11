@@ -302,6 +302,21 @@ pub async fn execute(
                 reporter
                     .logf(format!("$ {}", rendered.lines().next().unwrap_or("")))
                     .await;
+                // In a GUI session the keychain is writable again, so Xcode
+                // automatic signing goes from failing loudly to MINTING
+                // silently — each archive can burn one of the team's capped
+                // certificate slots behind a green checkmark. Warn while it's
+                // still one log line, not a portal cleanup.
+                if gui_uid.is_some() && invokes_automatic_signing(&rendered) {
+                    reporter
+                        .log(
+                            "⚠ automatic signing inside a GUI session: this step can MINT \
+                             certificates and silently burn cert slots — prefer \
+                             CODE_SIGN_STYLE=Manual with an explicit profile \
+                             (docs/execution-context.md)",
+                        )
+                        .await;
+                }
                 execute_run_step(
                     &rendered,
                     step.shell.as_deref(),
@@ -604,6 +619,15 @@ async fn console_user_uid() -> Option<(String, u32)> {
         return None;
     }
     Some((name, uid))
+}
+
+/// Does a step command invoke Xcode automatic signing — the flows that can
+/// create ("mint") certificates when the keychain is writable? Heuristic
+/// string match on the rendered command; false negatives are acceptable
+/// (this only gates a warning), false positives are near-impossible since
+/// these flags have no other meaning.
+fn invokes_automatic_signing(cmd: &str) -> bool {
+    cmd.contains("-allowProvisioningUpdates") || cmd.contains("CODE_SIGN_STYLE=Automatic")
 }
 
 /// Whether steps will have a macOS GUI (Aqua) session, and therefore access to
@@ -1913,6 +1937,22 @@ outputs:
         let v = needs_to_json(&needs);
         assert_eq!(v["compile"]["outputs"]["artifact"], json!("out.tar"));
         assert_eq!(v["compile"]["result"], json!("success"));
+    }
+
+    // --- invokes_automatic_signing ---
+
+    #[test]
+    fn automatic_signing_detection() {
+        assert!(invokes_automatic_signing(
+            "xcodebuild archive -scheme App -allowProvisioningUpdates"
+        ));
+        assert!(invokes_automatic_signing(
+            "xcodebuild CODE_SIGN_STYLE=Automatic archive"
+        ));
+        assert!(!invokes_automatic_signing(
+            "xcodebuild archive CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER=x"
+        ));
+        assert!(!invokes_automatic_signing("cargo build --release"));
     }
 
     // --- decide_session ---
