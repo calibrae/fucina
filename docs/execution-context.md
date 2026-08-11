@@ -85,9 +85,35 @@ Two traps that follow:
   `~/Library/MobileDevice/Provisioning Profiles/`, so an old same-named file silently wins.
   Purge before installing the current pair.
 
-## If a job genuinely needs the session
+## If a job genuinely needs the session: `FUCINA_SESSION: gui` (v0.5.0)
 
-Wrapping a step in `launchctl asuser <uid> sudo -u <user> …` rejoins the Aqua session and
-restores keychain/TCC access. fucina does not do this today; it would be a per-job opt-in if
-something ever truly requires it. Prefer the throwaway keychain: it needs nobody logged in,
-survives headless reboots, and leaves no ambient credentials for a job to steal.
+Some workloads cannot be untangled from the login session — Xcode automatic signing,
+fastlane lanes without `setup_ci`, anything TCC-gated. For those, a job can opt in:
+
+```yaml
+# workflow- or job-level env
+env:
+  FUCINA_SESSION: gui
+```
+
+When granted, fucina wraps that job's steps in `launchctl asuser <uid> sudo -u <user> …`:
+launchd adopts the console user's Mach bootstrap and security session before dropping
+privilege, so steps see the real Aqua session — login keychain, ssh-agent, TCC — exactly as
+if typed in Terminal.
+
+The grant has three conditions, each refused loudly in the job log:
+
+1. The runner's `config.yaml` sets **`allow_gui_session: true`** (default false — a repo
+   must not be able to demand ambient credentials from a hardened runner).
+2. The runner has a **`run_as`** user (the daemon user has no session to join).
+3. The **console user is the `run_as` user** — someone is actually logged in as them
+   (auto-login satisfies this across reboots).
+
+`FUCINA_SESSION` as exported to the steps always states the **granted** reality, never the
+request: a denied job sees `FUCINA_SESSION=headless` plus a `⚠ … DENIED: <reason>` line in
+its log, so it can fall back to the throwaway keychain instead of failing mysteriously.
+
+Reach for this deliberately. A gui-session job can read everything the console user can —
+it is precisely the ambient exposure the daemon default removes. The throwaway keychain
+remains the better answer for plain codesign/notarize flows: it needs nobody logged in and
+works identically on every runner. The session hatch is for the flows that genuinely cannot.

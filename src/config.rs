@@ -32,6 +32,12 @@ pub struct Config {
     /// (required on macOS for LAN access via Local Network Privacy exemption).
     #[serde(default)]
     pub run_as: Option<String>,
+    /// Allow jobs to opt into the `run_as` user's GUI (Aqua) session by
+    /// declaring `FUCINA_SESSION: gui` in their workflow/job env. Grants the
+    /// job ambient session credentials — login keychain, ssh-agent, TCC — so
+    /// keep it off (the default) on runners that execute untrusted workflows.
+    #[serde(default)]
+    pub allow_gui_session: bool,
 }
 
 fn default_name() -> String {

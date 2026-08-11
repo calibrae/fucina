@@ -22,6 +22,7 @@ pub struct Poller {
     fetch_interval: std::time::Duration,
     work_dir: PathBuf,
     run_as: Option<String>,
+    allow_gui_session: bool,
     tasks_version: i64,
     /// Tasks received while at capacity, awaiting a free worker slot.
     pending: VecDeque<Task>,
@@ -44,6 +45,7 @@ impl Poller {
         fetch_interval_secs: u64,
         work_dir: PathBuf,
         run_as: Option<String>,
+        allow_gui_session: bool,
         task_state: Arc<TaskStateFile>,
     ) -> Self {
         Self {
@@ -52,6 +54,7 @@ impl Poller {
             fetch_interval: std::time::Duration::from_secs(fetch_interval_secs),
             work_dir,
             run_as,
+            allow_gui_session,
             tasks_version: 0,
             pending: VecDeque::new(),
             active: Arc::new(Mutex::new(HashSet::new())),
@@ -189,6 +192,7 @@ impl Poller {
         let client = self.client.clone();
         let work_dir = self.work_dir.clone();
         let run_as = self.run_as.clone();
+        let allow_gui_session = self.allow_gui_session;
         let active = self.active.clone();
         let task_state = self.task_state.clone();
         let task_id = task.id;
@@ -205,6 +209,7 @@ impl Poller {
                 reporter.clone(),
                 &work_dir,
                 run_as.as_deref(),
+                allow_gui_session,
                 shutdown,
             )
             .await

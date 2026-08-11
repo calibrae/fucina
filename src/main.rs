@@ -389,10 +389,19 @@ pub async fn run_daemon(
         config.fetch_interval,
         config.work_dir.clone(),
         config.run_as.clone(),
+        config.allow_gui_session,
         task_state,
     );
     if let Some(user) = &config.run_as {
-        info!("workflow steps will run as user '{}' via sudo", user);
+        info!(
+            "workflow steps will run as user '{}' via sudo (gui session opt-in: {})",
+            user,
+            if config.allow_gui_session {
+                "allowed"
+            } else {
+                "disabled"
+            }
+        );
     }
 
     if let Err(e) = poller.run(shutdown_rx).await {
