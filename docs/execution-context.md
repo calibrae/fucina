@@ -43,14 +43,22 @@ if [ "$FUCINA_SESSION" = headless ]; then
 fi
 ```
 
-To confirm from inside a step:
+To confirm from inside a step, probe — don't trust env vars:
 
 ```bash
-echo "session=${SECURITYSESSIONID:-<none>} user=$(id -un)"
-security find-identity -v -p codesigning    # what can I actually sign with?
+echo "FUCINA_SESSION=$FUCINA_SESSION user=$(id -un)"
+security find-identity -v -p codesigning          # what can I sign with?
+security add-generic-password -a probe -s probe -w x \
+  && security delete-generic-password -a probe -s probe \
+  && echo "keychain writable" || echo "keychain NOT writable"
 ```
 
-An empty `SECURITYSESSIONID` means the login keychain will not work, full stop.
+Empirically (2026-08-11, speedwagon A/B): the headless daemon context fails that write with
+`SecKeychainItemCreateFromContent: Write permissions error`; the same op under a granted gui
+session succeeds. Note that `SECURITYSESSIONID` is **empty in both** — `launchctl asuser`
+attaches the audit session without injecting the env var — so its absence proves nothing.
+`FUCINA_SESSION` (runner-provided, granted reality) and the write-probe are the reliable
+tells.
 
 ## Signing from a job (the pattern that always works)
 
