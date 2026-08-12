@@ -17,7 +17,11 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 #[derive(Parser)]
-#[command(name = "fucina", about = "Gitea Actions runner (Rust)")]
+#[command(
+    name = "fucina",
+    version,
+    about = concat!("Gitea Actions runner (Rust) — v", env!("CARGO_PKG_VERSION"))
+)]
 struct Cli {
     /// Path to config file. When not given, defaults to
     /// `~/gitea-runner-rs/config.yaml` so the `.app` bundle can be
@@ -416,6 +420,21 @@ pub async fn run_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // clap's own consistency check, plus: --version must be wired and the
+        // help text must carry the version so `fucina --help` answers "which
+        // build is this?" on its own.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+        let cmd = Cli::command();
+        assert_eq!(cmd.get_version(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(cmd
+            .get_about()
+            .map(|a| a.to_string().contains(env!("CARGO_PKG_VERSION")))
+            .unwrap_or(false));
+    }
 
     #[test]
     fn plist_version_extracts() {
