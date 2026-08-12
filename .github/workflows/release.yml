@@ -14,8 +14,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Artifact names come from the git tag; the binary's version comes from
+  # Cargo.toml. Nothing else asserts they agree, so a mistagged release ships
+  # an archive whose name lies about its contents (the drift apytti hit as
+  # "tag says v0.6.9, artifact is 0.6.8"). Fail fast instead.
+  guard:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert versions agree
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          CARGO=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          echo "tag=$TAG cargo=$CARGO"
+          [ "${TAG#v}" = "$CARGO" ] || {
+            echo "::error::tag $TAG does not match Cargo.toml version $CARGO — retag or bump before releasing"
+            exit 1
+          }
+
   build:
     name: Build (${{ matrix.target }})
+    needs: guard
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +93,7 @@ jobs:
 
   pkg:
     name: macOS .pkg (signed + notarized + stapled)
+    needs: guard
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
