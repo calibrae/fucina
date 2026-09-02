@@ -72,6 +72,15 @@ fn daemon_status() -> isize {
     }
 }
 
+/// A registered daemon owns the runner even while it still awaits approval:
+/// the moment the user flips the Login Items toggle it starts polling, and an
+/// in-app poller still alive at that point recreates the double-instance
+/// lottery (a task grabbed by the GUI process runs as the console user, not
+/// `run_as`).
+fn daemon_owns_runner(status: isize) -> bool {
+    status == SM_ENABLED || status == SM_REQUIRES_APPROVAL
+}
+
 unsafe fn nserror_string(err: *mut AnyObject) -> String {
     if err.is_null() {
         return "unknown error".into();
@@ -387,15 +396,26 @@ declare_class!(
                         {
                             return;
                         }
-                        match daemon_register() {
-                            Ok(()) => {
+                        // Trust the resulting status over the return value:
+                        // macOS 26 has been seen returning an error from
+                        // register while the registration still landed
+                        // (pending approval). Acting on the error alone left
+                        // the in-app poller running next to the daemon (trish,
+                        // 2026-09-01).
+                        let result = daemon_register();
+                        let status = daemon_status();
+                        match result {
+                            Err(e) if !daemon_owns_runner(status) => {
+                                show_simple_alert("Install Failed", &e)
+                            }
+                            _ => {
                                 // Single-instance guarantees: drop the login item
                                 // and stop the in-app worker.
                                 if login_item_enabled(&self.ivars().login_item_name) {
                                     set_login_item(&self.ivars().login_item_name, false);
                                 }
                                 let _ = self.ivars().shutdown_tx.send(true);
-                                if daemon_status() == SM_REQUIRES_APPROVAL {
+                                if status == SM_REQUIRES_APPROVAL {
                                     if run_alert(
                                         "One More Step",
                                         "macOS needs your approval: enable Fucina under \
@@ -414,7 +434,6 @@ declare_class!(
                                     );
                                 }
                             }
-                            Err(e) => show_simple_alert("Install Failed", &e),
                         }
                     }
                 }
@@ -425,7 +444,7 @@ declare_class!(
         fn toggle_login(&self, sender: Option<&AnyObject>) {
             // Daemon mode owns the runner — a login item would resurrect the
             // giorno double-instance bug. Refuse and keep the checkbox off.
-            if daemon_status() == SM_ENABLED {
+            if daemon_owns_runner(daemon_status()) {
                 unsafe {
                     if let Some(sender) = sender {
                         let _: () = msg_send![sender, setState: STATE_OFF];
@@ -544,7 +563,7 @@ pub fn run(config: Config) -> Result<()> {
     // and this app is a pure controller (status, logs, install/uninstall) —
     // spawning a second poller here would recreate the giorno double-instance
     // lottery. The Local Network dance is also the daemon's problem, not ours.
-    let daemon_active = daemon_status() == SM_ENABLED;
+    let daemon_active = daemon_owns_runner(daemon_status());
 
     // Fire a Bonjour browse so macOS surfaces the Local Network permission
     // prompt attributed to this bundle (BSD-socket connects don't trigger it).
@@ -563,6 +582,27 @@ pub fn run(config: Config) -> Result<()> {
         info!("system daemon active — running as controller only");
         None
     } else {
+        // The daemon can get registered while we host the runner — from our
+        // own menu (whose register call may misreport, see daemon_menu) or
+        // from outside. Whatever the path, the in-app poller must stop before
+        // the daemon starts fetching, so watch the status rather than trust
+        // any single code path to signal it.
+        let tx = shutdown_tx.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if tx.is_closed() {
+                break;
+            }
+            let status = daemon_status();
+            if daemon_owns_runner(status) {
+                info!(
+                    "system daemon registered (status {status}) — stopping the in-app runner \
+                     so exactly one instance polls"
+                );
+                let _ = tx.send(true);
+                break;
+            }
+        });
         let worker_cfg = config.clone();
         Some(std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(5));
