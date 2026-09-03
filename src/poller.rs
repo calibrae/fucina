@@ -11,9 +11,9 @@ use crate::reporter::Reporter;
 use crate::runner;
 use crate::taskstate::TaskStateFile;
 
-/// Upper bound on tasks held in the pending queue. A task that arrives when
-/// all worker slots are busy is queued rather than dropped; only a queue this
-/// deep (a genuinely overloaded runner) falls back to dropping.
+/// Upper bound on tasks held in the pending queue. FetchTask is only called
+/// while a worker slot is free (see `poll_once`), so the queue is a safety
+/// net for the rare task that arrives after a slot was taken, not a buffer.
 const MAX_PENDING: usize = 128;
 
 pub struct Poller {
@@ -97,6 +97,18 @@ impl Poller {
         // First, give any queued tasks a chance to run — a worker may have
         // freed up since the last tick.
         self.drain_pending(&shutdown);
+
+        // Never fetch beyond capacity. A task handed out by FetchTask is
+        // assigned to this runner in Gitea from that moment on, and nothing
+        // heartbeats it while it waits in our local queue: Gitea's zombie
+        // timeout (~10 min) fails it before it starts, we then run it anyway
+        // and report Success into a job Gitea already closed (capucine,
+        // 2026-09-03). Leave queued work on the server, where other runners
+        // can take it.
+        if self.capacity.available_permits() == 0 {
+            debug!("at capacity — not fetching");
+            return Ok(());
+        }
 
         debug!("fetching tasks (version={})", self.tasks_version);
         let resp = self.client.fetch_task(self.tasks_version).await?;
