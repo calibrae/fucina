@@ -51,6 +51,18 @@ fn is_already_archived(e: &anyhow::Error) -> bool {
     s.contains("log file has been archived") || s.contains("AlreadyExists")
 }
 
+/// Gitea encodes a task result either as the protobuf enum name or as its
+/// numeric value, depending on which serializer answers; accept both.
+fn state_is_cancelled(state: &serde_json::Value) -> bool {
+    match state.get("result") {
+        Some(serde_json::Value::String(s)) => {
+            s == "RESULT_CANCELLED" || s.eq_ignore_ascii_case("cancelled")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_i64() == Some(TaskResult::Cancelled as i64),
+        _ => false,
+    }
+}
+
 /// Buffers log lines and reports task state back to Gitea
 pub struct Reporter {
     client: Arc<ConnectClient>,
@@ -162,6 +174,36 @@ impl Reporter {
         .await
     }
 
+    /// Ask Gitea whether this task is still wanted.
+    ///
+    /// Gitea answers every `UpdateTask` with the authoritative task state, and
+    /// a run superseded by a newer push (or cancelled by hand) comes back as
+    /// `RESULT_CANCELLED`. Nothing else tells a runner its job was called off:
+    /// without this a cancelled `mvn test` runs to completion, holding every
+    /// core against the run that replaced it (giorno, capucine 434/435).
+    ///
+    /// Doubles as the liveness ping that keeps Gitea from reaping a long step
+    /// as a zombie.
+    ///
+    /// Advisory and deliberately single-attempt — a blip must never interrupt
+    /// a healthy job, so any error reads as "not cancelled".
+    pub async fn poll_cancelled(&self) -> bool {
+        let state = TaskState {
+            id: self.task_id,
+            result: TaskResult::Unspecified,
+            started_at: None,
+            stopped_at: None,
+            steps: vec![],
+        };
+        match self.client.update_task(state, HashMap::new()).await {
+            Ok(resp) => resp.state.as_ref().is_some_and(state_is_cancelled),
+            Err(e) => {
+                debug!("task {}: cancellation poll failed: {:#}", self.task_id, e);
+                false
+            }
+        }
+    }
+
     /// Report task completed. `outputs` carries the job's resolved
     /// `outputs:` block back to Gitea so downstream jobs see them in
     /// their `needs.<job>.outputs` context.
@@ -208,6 +250,27 @@ impl Reporter {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cancellation_is_read_from_either_encoding() {
+        let named = serde_json::json!({"id": "7", "result": "RESULT_CANCELLED"});
+        let numeric = serde_json::json!({"id": "7", "result": 3});
+        let lower = serde_json::json!({"result": "cancelled"});
+        assert!(state_is_cancelled(&named));
+        assert!(state_is_cancelled(&numeric));
+        assert!(state_is_cancelled(&lower));
+    }
+
+    #[test]
+    fn a_running_or_absent_result_is_not_cancellation() {
+        // The common answers while a job is healthy must never abort it.
+        assert!(!state_is_cancelled(
+            &serde_json::json!({"result": "RESULT_UNSPECIFIED"})
+        ));
+        assert!(!state_is_cancelled(&serde_json::json!({"result": 0})));
+        assert!(!state_is_cancelled(&serde_json::json!({"result": 1})));
+        assert!(!state_is_cancelled(&serde_json::json!({})));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_succeeds_after_transient_failures() {

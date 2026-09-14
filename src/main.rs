@@ -9,6 +9,7 @@ mod taskstate;
 
 #[cfg(target_os = "macos")]
 mod macos_menu;
+mod procgroup;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -387,15 +388,7 @@ pub async fn run_daemon(
         }
     }
 
-    let mut poller = poller::Poller::new(
-        client,
-        config.capacity,
-        config.fetch_interval,
-        config.work_dir.clone(),
-        config.run_as.clone(),
-        config.allow_gui_session,
-        task_state,
-    );
+    let mut poller = poller::Poller::new(client, &config, task_state);
     if let Some(user) = &config.run_as {
         info!(
             "workflow steps will run as user '{}' via sudo (gui session opt-in: {})",

@@ -23,6 +23,8 @@ pub struct Poller {
     work_dir: PathBuf,
     run_as: Option<String>,
     allow_gui_session: bool,
+    /// Wall-clock ceiling for one job, from `timeout:` in the config.
+    job_timeout: std::time::Duration,
     tasks_version: i64,
     /// Tasks received while at capacity, awaiting a free worker slot.
     pending: VecDeque<Task>,
@@ -41,20 +43,17 @@ fn task_known(active: &HashSet<i64>, pending: &VecDeque<Task>, id: i64) -> bool 
 impl Poller {
     pub fn new(
         client: Arc<ConnectClient>,
-        capacity: usize,
-        fetch_interval_secs: u64,
-        work_dir: PathBuf,
-        run_as: Option<String>,
-        allow_gui_session: bool,
+        config: &crate::config::Config,
         task_state: Arc<TaskStateFile>,
     ) -> Self {
         Self {
             client,
-            capacity: Arc::new(Semaphore::new(capacity)),
-            fetch_interval: std::time::Duration::from_secs(fetch_interval_secs),
-            work_dir,
-            run_as,
-            allow_gui_session,
+            capacity: Arc::new(Semaphore::new(config.capacity)),
+            fetch_interval: std::time::Duration::from_secs(config.fetch_interval),
+            work_dir: config.work_dir.clone(),
+            run_as: config.run_as.clone(),
+            allow_gui_session: config.allow_gui_session,
+            job_timeout: std::time::Duration::from_secs(config.timeout),
             tasks_version: 0,
             pending: VecDeque::new(),
             active: Arc::new(Mutex::new(HashSet::new())),
@@ -205,6 +204,7 @@ impl Poller {
         let work_dir = self.work_dir.clone();
         let run_as = self.run_as.clone();
         let allow_gui_session = self.allow_gui_session;
+        let job_timeout = self.job_timeout;
         let active = self.active.clone();
         let task_state = self.task_state.clone();
         let task_id = task.id;
@@ -222,6 +222,7 @@ impl Poller {
                 &work_dir,
                 run_as.as_deref(),
                 allow_gui_session,
+                job_timeout,
                 shutdown,
             )
             .await

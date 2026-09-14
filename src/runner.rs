@@ -3,7 +3,8 @@ use base64::Engine;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{error, info, warn};
@@ -11,6 +12,10 @@ use tracing::{error, info, warn};
 use crate::expr::{Context as ExprCtx, JobStatus};
 use crate::proto::{self, StepState, Task, Timestamp};
 use crate::reporter::Reporter;
+
+/// How often a running step asks Gitea whether the job is still wanted. Also
+/// the liveness ping that keeps a long step off Gitea's zombie list.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Represents a parsed workflow step
 #[derive(Debug)]
@@ -34,8 +39,13 @@ pub async fn execute(
     work_dir: &Path,
     run_as: Option<&str>,
     allow_gui_session: bool,
+    job_timeout: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<proto::TaskResult> {
+    // Every step's process group, so the job can reclaim its whole tree at the
+    // end — including anything a step left running in the background.
+    let step_groups: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+    let deadline = tokio::time::Instant::now() + job_timeout;
     // Decode workflow payload (base64-encoded YAML)
     let yaml_bytes = base64::engine::general_purpose::STANDARD
         .decode(&task.workflow_payload)
@@ -328,6 +338,8 @@ pub async fn execute(
                     gui_uid,
                     &reporter,
                     &mut shutdown,
+                    deadline,
+                    &step_groups,
                 )
                 .await
             } else if let Some(uses) = &step.uses {
@@ -381,15 +393,22 @@ pub async fn execute(
         if result == proto::TaskResult::Failure {
             overall_result = proto::TaskResult::Failure;
         }
+        // Gitea has already closed this job: running the remaining steps would
+        // burn the machine for a verdict nobody will read.
+        if result == proto::TaskResult::Cancelled {
+            overall_result = proto::TaskResult::Cancelled;
+            warn!("task cancelled — skipping remaining steps");
+            break;
+        }
     }
 
     // --- Job outputs (Gap 4) --------------------------------------------
     // The job's `outputs:` block references `${{ steps.<id>.outputs.<x> }}`;
     // evaluate it now that every step's outputs are in the context.
-    ctx.status = if overall_result == proto::TaskResult::Failure {
-        JobStatus::Failure
-    } else {
-        JobStatus::Success
+    ctx.status = match overall_result {
+        proto::TaskResult::Failure => JobStatus::Failure,
+        proto::TaskResult::Cancelled => JobStatus::Cancelled,
+        _ => JobStatus::Success,
     };
     ctx.set("steps", serde_json::Value::Object(steps_json));
     let job_outputs = parse_job_outputs(job, &ctx);
@@ -411,6 +430,31 @@ pub async fn execute(
     //
     // The verdict now goes out immediately after the last step, so a slow
     // delete can no longer cost a task its result.
+    // Reclaim anything the job left running — a background service a step
+    // started, a test harness that outlived its shell, a container reaper.
+    // Before the verdict so stragglers can be named in the job's own log, and
+    // before the cleanup below so no live process races the delete.
+    let groups: Vec<i32> = std::mem::take(&mut *step_groups.lock().unwrap());
+    let mut reclaimed = 0usize;
+    for pgid in groups {
+        if crate::procgroup::group_alive(pgid)
+            && crate::procgroup::reap_group(pgid, Duration::from_secs(5)).await
+        {
+            reclaimed += 1;
+        }
+    }
+    if reclaimed > 0 {
+        warn!(
+            "reclaimed {} straggling process group(s) at job end",
+            reclaimed
+        );
+        reporter
+            .logf(format!(
+                "Reclaimed {reclaimed} process group(s) still running at job end"
+            ))
+            .await;
+    }
+
     reporter
         .logf(format!(
             "Finalizing job — reporting {} to Gitea",
@@ -990,6 +1034,8 @@ async fn execute_run_step(
     gui_uid: Option<u32>,
     reporter: &Reporter,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    deadline: tokio::time::Instant,
+    step_groups: &Arc<Mutex<Vec<i32>>>,
 ) -> Result<proto::TaskResult> {
     let shell = shell.unwrap_or("bash");
     let (shell_bin, shell_args) = match shell {
@@ -1061,7 +1107,18 @@ async fn execute_run_step(
         }
     }
 
+    // Own process group per step: the pid fucina holds is `sudo`, never the
+    // shell/mvn/JVM doing the work, so only a group signal reaches the tree.
+    // See `procgroup` for what leaking one costs.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     let mut child = cmd.spawn().context("failed to spawn command")?;
+
+    // `id()` stops answering once the child is awaited, and `process_group(0)`
+    // makes the child its own group leader, so pgid == pid.
+    let pgid = child.id().map(|p| p as i32).unwrap_or(0);
+    step_groups.lock().unwrap().push(pgid);
 
     // Stream stdout and stderr concurrently via a shared channel.
     // This gives live log uploads during long-running steps (playwright, builds, etc.)
@@ -1094,7 +1151,13 @@ async fn execute_run_step(
 
     let mut line_count: u32 = 0;
     const FLUSH_EVERY: u32 = 20;
-    let mut killed = false;
+    // How long a signalled tree gets to unwind before SIGKILL. Long enough for
+    // a JVM's shutdown hooks, short enough not to stall the worker slot.
+    const GRACE: Duration = Duration::from_secs(10);
+    let mut ended: Option<(proto::TaskResult, &str)> = None;
+
+    let mut cancel_poll = tokio::time::interval(CANCEL_POLL_INTERVAL);
+    cancel_poll.tick().await; // the first tick is immediate
 
     loop {
         tokio::select! {
@@ -1112,24 +1175,49 @@ async fn execute_run_step(
             }
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
-                    // Runner is shutting down — kill the child process so the
-                    // spawned IO tasks exit, then report failure.
-                    let _ = child.kill().await;
-                    killed = true;
+                    ended = Some((
+                        proto::TaskResult::Failure,
+                        "Runner shutting down — step and its process tree killed",
+                    ));
+                    break;
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                ended = Some((
+                    proto::TaskResult::Failure,
+                    "Job exceeded the runner's timeout — step and its process tree killed",
+                ));
+                break;
+            }
+            _ = cancel_poll.tick() => {
+                if reporter.poll_cancelled().await {
+                    ended = Some((
+                        proto::TaskResult::Cancelled,
+                        "Job cancelled by Gitea — step and its process tree killed",
+                    ));
                     break;
                 }
             }
         }
     }
 
+    // Reap before awaiting the IO tasks: a grandchild still holding the step's
+    // stdout keeps those readers from ever seeing EOF, which is how a killed
+    // step used to hang finalization.
+    if ended.is_some() {
+        crate::procgroup::reap_group(pgid, GRACE).await;
+        let _ = child.kill().await;
+    }
+
     let _ = out_task.await;
     let _ = err_task.await;
     let _ = reporter.flush_logs().await;
 
-    if killed {
-        reporter.log("Runner shutting down — step killed").await;
+    if let Some((result, why)) = ended {
+        let _ = child.wait().await;
+        reporter.log(why).await;
         let _ = reporter.flush_logs().await;
-        return Ok(proto::TaskResult::Failure);
+        return Ok(result);
     }
 
     let status = child.wait().await.context("failed to wait for command")?;

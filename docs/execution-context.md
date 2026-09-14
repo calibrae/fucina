@@ -125,3 +125,35 @@ Reach for this deliberately. A gui-session job can read everything the console u
 it is precisely the ambient exposure the daemon default removes. The throwaway keychain
 remains the better answer for plain codesign/notarize flows: it needs nobody logged in and
 works identically on every runner. The session hatch is for the flows that genuinely cannot.
+
+## Step process trees (v0.5.5+)
+
+fucina never holds the process doing the work. A step is
+`sudo -u <user> -H -E -- bash -c …`, which forks the shell, which forks `mvn`,
+which forks a surefire JVM. Signalling the pid fucina owns kills the head and
+orphans the rest — `SIGKILL` can't even be forwarded by `sudo`.
+
+Every step therefore spawns with `process_group(0)` (its own process group,
+pgid == pid) and is reclaimed with `killpg`: `SIGTERM`, a grace period, then
+`SIGKILL`. Three paths reap immediately — runner shutdown, job timeout, and
+Gitea cancellation — and a job-end sweep reclaims every group a step left
+behind, before the workspace delete so nothing races it. Stragglers are named
+in the job's own log (`Reclaimed N process group(s) still running at job end`).
+
+Two consequences worth knowing:
+
+- **Background services survive between steps, not past the job.** Starting a
+  server in one step and using it in the next still works; it is reclaimed when
+  the job ends rather than leaking onto the host.
+- **A killed step can no longer hang finalization.** An orphan holding the
+  step's stdout kept the log readers from ever seeing EOF; killing the group
+  closes the pipe.
+
+`timeout:` in the runner config is now enforced (it was parsed and ignored
+before v0.5.5): the deadline covers the whole job, and the step running when it
+expires is killed with its tree.
+
+Cancellation is detected by polling: every 30s a running step sends `UpdateTask`
+and reads the authoritative state back, so a run superseded by a newer push
+stops instead of racing its replacement for the machine. That ping doubles as
+the liveness signal that keeps a long step off Gitea's zombie list.
