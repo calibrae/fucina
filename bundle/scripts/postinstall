@@ -48,8 +48,16 @@ if [ ! -f "$RUNNER_FILE" ]; then
   sudo -u "$CONSOLE_USER" /usr/bin/osascript -e \
     "display dialog \"Fucina installed. Edit the opened config.yaml with your Gitea URL, then run:\n\n  fucina --config $CONFIG register --token <TOKEN>\n\nThen launch Fucina.app.\" buttons {\"OK\"} default button 1 with title \"Fucina\"" || true
 else
-  # Credentials present — launch the app
-  sudo -u "$CONSOLE_USER" /usr/bin/open -a /Applications/Fucina.app || true
+  # Credentials present — (re)launch the app.
+  #
+  # `open -a` only ACTIVATES an already-running instance, which left the
+  # previous version's binary running next to the freshly installed daemon
+  # after every upgrade (observed on giorno and speedwagon, 2026-09-14: apps
+  # from a 12-day-old release still up). Quit first so the new bundle is the
+  # one that runs. The daemon is a separate SMAppService job and is untouched.
+  sudo -u "$CONSOLE_USER" /usr/bin/osascript -e 'quit app "Fucina"' >/dev/null 2>&1 || true
+  sleep 2
+  sudo -u "$CONSOLE_USER" /usr/bin/open /Applications/Fucina.app || true
 fi
 
 exit 0
