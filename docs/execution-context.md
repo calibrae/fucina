@@ -157,3 +157,19 @@ Cancellation is detected by polling: every 30s a running step sends `UpdateTask`
 and reads the authoritative state back, so a run superseded by a newer push
 stops instead of racing its replacement for the machine. That ping doubles as
 the liveness signal that keeps a long step off Gitea's zombie list.
+
+### Upgrades and in-flight jobs
+
+Replacing the app bundle makes launchd restart the daemon job — it does not
+wait for fucina's own drain. On 2026-09-14 that killed capucine run 437's
+backend job five seconds before the new daemon came up: 131 test classes had
+passed, the log just stops mid-step. **Install on an idle runner**, or expect
+the running job to die and be re-run.
+
+Before 0.5.5 the steps shared the daemon's process group, so such a restart at
+least took their trees down with it (that is how the upgrade reaped four
+two-day-old orphans on giorno by itself). Since each step now has its own
+group, an abruptly killed daemon would leave those trees running — so the
+groups are persisted in `active-tasks.json` and reclaimed at the next startup,
+guarded by a check that a live member of the group still references the
+runner's `work_dir`, so a recycled pgid is never signalled.

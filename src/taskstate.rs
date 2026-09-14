@@ -15,6 +15,14 @@ use tracing::{debug, warn};
 #[derive(Serialize, Deserialize, Default)]
 struct State {
     task_ids: Vec<i64>,
+    /// Process groups of steps currently running. A daemon killed outright —
+    /// launchd restarting the job when a pkg replaces the bundle, a crash —
+    /// never runs its own cleanup, and since each step now lives in its own
+    /// process group it no longer dies with the daemon either. These survive
+    /// so the next startup can reclaim them. Absent in files written by
+    /// versions before 0.5.6.
+    #[serde(default)]
+    step_groups: Vec<i32>,
 }
 
 pub struct TaskStateFile {
@@ -86,20 +94,70 @@ impl TaskStateFile {
         }
     }
 
+    /// Record that a step's process group is running.
+    pub fn add_group(&self, pgid: i32) {
+        if pgid <= 1 {
+            return;
+        }
+        let _g = self.lock.lock().unwrap();
+        let mut state = self.read_locked();
+        if !state.step_groups.contains(&pgid) {
+            state.step_groups.push(pgid);
+            if let Err(e) = self.write_locked(&state) {
+                warn!(
+                    "taskstate: failed to persist process group {}: {:#}",
+                    pgid, e
+                );
+            }
+        }
+    }
+
+    /// Forget process groups the job already reclaimed itself.
+    pub fn remove_groups(&self, pgids: &[i32]) {
+        if pgids.is_empty() {
+            return;
+        }
+        let _g = self.lock.lock().unwrap();
+        let mut state = self.read_locked();
+        let before = state.step_groups.len();
+        state.step_groups.retain(|p| !pgids.contains(p));
+        if state.step_groups.len() < before {
+            if let Err(e) = self.write_locked(&state) {
+                warn!("taskstate: failed to clear process groups: {:#}", e);
+            }
+        }
+    }
+
+    /// Return process groups left behind by a previous process, and clear them.
+    pub fn drain_stale_groups(&self) -> Vec<i32> {
+        let _g = self.lock.lock().unwrap();
+        let mut state = self.read_locked();
+        if state.step_groups.is_empty() {
+            return vec![];
+        }
+        let groups = std::mem::take(&mut state.step_groups);
+        if let Err(e) = self.write_locked(&state) {
+            warn!("taskstate: failed to clear stale process groups: {:#}", e);
+        }
+        groups
+    }
+
     /// Return all surviving task IDs and clear the file.
     /// Called once on startup — any IDs still present belong to a previous
     /// process that died without cleaning up.
     pub fn drain_stale(&self) -> Vec<i64> {
         let _g = self.lock.lock().unwrap();
-        let state = self.read_locked();
+        let mut state = self.read_locked();
         if state.task_ids.is_empty() {
             return vec![];
         }
-        // Clear first — if we crash again after reporting, we don't double-report.
-        if let Err(e) = self.write_locked(&State::default()) {
+        // Clear first — if we crash again after reporting, we don't
+        // double-report. Process groups are drained separately, so leave them.
+        let ids = std::mem::take(&mut state.task_ids);
+        if let Err(e) = self.write_locked(&state) {
             warn!("taskstate: failed to clear stale state: {:#}", e);
         }
-        state.task_ids
+        ids
     }
 }
 
@@ -116,6 +174,44 @@ mod tests {
         let p = tmp_path(name);
         let _ = std::fs::remove_file(&p); // clean slate
         TaskStateFile::new(p)
+    }
+
+    #[test]
+    fn process_groups_survive_a_task_id_drain() {
+        // The two drains are independent: reporting stale tasks to Gitea must
+        // not discard the groups still to be reclaimed, and vice versa.
+        let ts = tmp_state("groups-independent");
+        ts.add(41);
+        ts.add_group(2350);
+        assert_eq!(ts.drain_stale(), vec![41]);
+        assert_eq!(ts.drain_stale_groups(), vec![2350]);
+        assert!(ts.drain_stale_groups().is_empty());
+    }
+
+    #[test]
+    fn a_job_that_cleans_up_leaves_no_group_behind() {
+        let ts = tmp_state("groups-removed");
+        ts.add_group(100);
+        ts.add_group(200);
+        ts.remove_groups(&[100, 200]);
+        assert!(ts.drain_stale_groups().is_empty());
+    }
+
+    #[test]
+    fn an_unusable_pgid_is_never_persisted() {
+        // 0 would mean "the daemon's own group" to killpg.
+        let ts = tmp_state("groups-guard");
+        ts.add_group(0);
+        ts.add_group(1);
+        assert!(ts.drain_stale_groups().is_empty());
+    }
+
+    #[test]
+    fn state_written_before_0_5_6_still_loads() {
+        let ts = tmp_state("groups-compat");
+        std::fs::write(&ts.path, r#"{"task_ids":[7]}"#).unwrap();
+        assert_eq!(ts.drain_stale(), vec![7]);
+        assert!(ts.drain_stale_groups().is_empty());
     }
 
     #[test]

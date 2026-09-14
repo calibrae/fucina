@@ -223,6 +223,7 @@ impl Poller {
                 run_as.as_deref(),
                 allow_gui_session,
                 job_timeout,
+                task_state.clone(),
                 shutdown,
             )
             .await

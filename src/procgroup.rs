@@ -15,8 +15,10 @@
 //! The fix is to put every step in its own process group (`process_group(0)`
 //! at spawn) and signal the group, which reaches the entire tree.
 
+use std::collections::HashSet;
+use std::path::Path;
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// Poll interval while waiting for a signalled group to go away.
 const POLL: Duration = Duration::from_millis(100);
@@ -84,9 +86,86 @@ pub async fn reap_group(pgid: i32, grace: Duration) -> bool {
     }
 }
 
+/// Process groups that still have a live member whose command line mentions
+/// `needle`.
+///
+/// This is the guard that makes reclaiming *persisted* groups safe. A pgid
+/// recorded before a reboot may since have been recycled by something
+/// unrelated, and signalling it blind would kill a stranger. Requiring a live
+/// member to reference the runner's own work directory keeps that from ever
+/// happening — a recycled pgid simply won't match.
+fn groups_referencing(ps_output: &str, needle: &str) -> HashSet<i32> {
+    let mut out = HashSet::new();
+    for line in ps_output.lines() {
+        let line = line.trim_start();
+        let Some((pgid, command)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pgid) = pgid.parse::<i32>() else {
+            continue;
+        };
+        if usable(pgid) && command.contains(needle) {
+            out.insert(pgid);
+        }
+    }
+    out
+}
+
+/// Reclaim step process groups a previous daemon left running.
+///
+/// Called once at startup. A daemon that is killed outright never runs its own
+/// end-of-job sweep — launchd restarts the job whenever a pkg replaces the
+/// bundle, which is exactly how capucine run 437 lost its backend job — and
+/// since 0.5.5 a step's group no longer dies with the daemon that spawned it.
+/// Anything still running from the last process is therefore reclaimed here,
+/// guarded by `groups_referencing` so a recycled pgid is never signalled.
+pub async fn reap_stale_groups(groups: &[i32], work_dir: &Path) {
+    if groups.is_empty() {
+        return;
+    }
+    let needle = work_dir.to_string_lossy().to_string();
+    let ps = match tokio::process::Command::new("ps")
+        .args(["-axo", "pgid=,command="])
+        .output()
+        .await
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(e) => {
+            warn!("could not list processes to reclaim stale step groups: {e}");
+            return;
+        }
+    };
+    let live = groups_referencing(&ps, &needle);
+    for pgid in groups.iter().copied().filter(|p| live.contains(p)) {
+        info!("reclaiming step process group {pgid} left by a previous run");
+        reap_group(pgid, Duration::from_secs(5)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_groups_touching_the_work_dir_are_reclaimable() {
+        let ps = "\
+  501 /usr/libexec/secd
+ 2350 sudo -u ci -H -E -- bash -c cd /Users/Shared/fucina-work/task-9/workspace
+ 2350 java -cp /Users/Shared/fucina-work/task-9/workspace/target/classes Foo
+ 4242 /Applications/Safari.app/Contents/MacOS/Safari
+";
+        let found = groups_referencing(ps, "/Users/Shared/fucina-work");
+        assert_eq!(found, HashSet::from([2350]));
+        // A recycled pgid running something unrelated is never signalled.
+        assert!(!found.contains(&4242));
+        assert!(!found.contains(&501));
+    }
+
+    #[test]
+    fn a_recycled_pgid_without_a_live_match_is_left_alone() {
+        let found = groups_referencing("  777 /usr/bin/ssh-agent\n", "/Users/Shared/fucina-work");
+        assert!(found.is_empty());
+    }
 
     #[test]
     fn never_targets_the_callers_own_group() {

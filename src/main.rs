@@ -363,6 +363,14 @@ pub async fn run_daemon(
     // Without this, Gitea keeps them as "running" and eventually stops
     // offering new work to this runner (stale task accumulation).
     let task_state = Arc::new(taskstate::TaskStateFile::alongside(&config.runner_file));
+
+    // A daemon killed outright (launchd restarting the job when a pkg replaces
+    // the bundle, or a crash) never runs its own end-of-job sweep, and since
+    // 0.5.5 a step's process group no longer dies with it either. Reclaim
+    // whatever the last process left running before taking new work.
+    let stale_groups = task_state.drain_stale_groups();
+    procgroup::reap_stale_groups(&stale_groups, &config.work_dir).await;
+
     let stale_ids = task_state.drain_stale();
     if !stale_ids.is_empty() {
         warn!(

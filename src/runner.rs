@@ -33,6 +33,7 @@ struct Step {
 }
 
 /// Execute a task (one job from a workflow)
+#[allow(clippy::too_many_arguments)]
 pub async fn execute(
     task: &Task,
     reporter: Arc<Reporter>,
@@ -40,6 +41,7 @@ pub async fn execute(
     run_as: Option<&str>,
     allow_gui_session: bool,
     job_timeout: Duration,
+    task_state: Arc<crate::taskstate::TaskStateFile>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<proto::TaskResult> {
     // Every step's process group, so the job can reclaim its whole tree at the
@@ -340,6 +342,7 @@ pub async fn execute(
                     &mut shutdown,
                     deadline,
                     &step_groups,
+                    task_state.as_ref(),
                 )
                 .await
             } else if let Some(uses) = &step.uses {
@@ -435,6 +438,7 @@ pub async fn execute(
     // Before the verdict so stragglers can be named in the job's own log, and
     // before the cleanup below so no live process races the delete.
     let groups: Vec<i32> = std::mem::take(&mut *step_groups.lock().unwrap());
+    task_state.remove_groups(&groups);
     let mut reclaimed = 0usize;
     for pgid in groups {
         if crate::procgroup::group_alive(pgid)
@@ -1036,6 +1040,7 @@ async fn execute_run_step(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     deadline: tokio::time::Instant,
     step_groups: &Arc<Mutex<Vec<i32>>>,
+    task_state: &crate::taskstate::TaskStateFile,
 ) -> Result<proto::TaskResult> {
     let shell = shell.unwrap_or("bash");
     let (shell_bin, shell_args) = match shell {
@@ -1119,6 +1124,7 @@ async fn execute_run_step(
     // makes the child its own group leader, so pgid == pid.
     let pgid = child.id().map(|p| p as i32).unwrap_or(0);
     step_groups.lock().unwrap().push(pgid);
+    task_state.add_group(pgid);
 
     // Stream stdout and stderr concurrently via a shared channel.
     // This gives live log uploads during long-running steps (playwright, builds, etc.)
