@@ -163,27 +163,43 @@ pub async fn execute(
 
     // --- Session mode -----------------------------------------------------
     // Default is headless: the daemon supervises, steps run via `sudo -u`
-    // outside any Aqua session, and ambient session credentials (login
-    // keychain, ssh-agent, TCC grants) are unreachable. A job that genuinely
-    // needs them — Xcode automatic signing, fastlane without setup_ci — opts
-    // in by declaring `FUCINA_SESSION: gui` in its workflow- or job-level
-    // env. The request is granted only when the runner's config allows it
-    // AND the console user is exactly the run_as user; then steps are wrapped
-    // in `launchctl asuser <uid>` so they attach to the real GUI session.
+    // inside the daemon's System bootstrap, and nothing that needs a security
+    // session works there — no login keychain, and even an ephemeral keychain
+    // can't sign (legacy trust and private-key use fail). A job opts in with
+    // `FUCINA_SESSION` in its workflow- or job-level env:
+    //   - `background`: steps join the run_as user's OWN session via
+    //     `launchctl asuser <run_as uid>`. Keychains and code signing work;
+    //     no Aqua, no console user, no config gate needed — it never leaves
+    //     the run_as user's security boundary (see decide_session).
+    //   - `gui`: steps join the console user's Aqua session (login keychain,
+    //     TCC, ssh-agent). Needs allow_gui_session and console user == run_as.
     // Whatever happens, the FUCINA_SESSION exported to steps states the
     // GRANTED reality, never the request, and a denial is written into the
     // job log with its reason — no more silent keychain mysteries.
-    let requested_gui = merged_env
-        .get("FUCINA_SESSION")
-        .map(|v| v.eq_ignore_ascii_case("gui"))
-        .unwrap_or(false);
     let console = console_user_uid().await;
-    let gui_uid = match decide_session(
-        requested_gui,
-        allow_gui_session,
-        run_as,
-        console.as_ref().map(|(name, uid)| (name.as_str(), *uid)),
-    ) {
+    let decision = match SessionRequest::parse(merged_env.get("FUCINA_SESSION").map(String::as_str))
+    {
+        Err(reason) => SessionDecision::Denied(reason),
+        Ok(SessionRequest::None) => SessionDecision::Headless,
+        Ok(_) if !cfg!(target_os = "macos") => SessionDecision::Denied(
+            "FUCINA_SESSION needs macOS — there is no launchd session to join on this host"
+                .to_string(),
+        ),
+        Ok(req) => {
+            let run_as_uid = match (req, run_as) {
+                (SessionRequest::Background, Some(user)) => user_uid(user).await,
+                _ => None,
+            };
+            decide_session(
+                req,
+                allow_gui_session,
+                run_as,
+                run_as_uid,
+                console.as_ref().map(|(name, uid)| (name.as_str(), *uid)),
+            )
+        }
+    };
+    let session = match &decision {
         SessionDecision::Gui(uid) => {
             reporter
                 .logf(format!(
@@ -192,31 +208,44 @@ pub async fn execute(
                     uid
                 ))
                 .await;
-            Some(uid)
+            "gui"
         }
-        SessionDecision::Denied(reason) => {
-            warn!("gui session requested but denied: {}", reason);
+        SessionDecision::Background(uid) => {
             reporter
                 .logf(format!(
-                    "⚠ FUCINA_SESSION: gui requested but DENIED: {} — running headless \
-                     (login keychain unavailable)",
+                    "Background session granted — steps run in {}'s own security session \
+                     (uid {}): keychains and code signing work, no GUI",
+                    run_as.unwrap_or("?"),
+                    uid
+                ))
+                .await;
+            "background"
+        }
+        SessionDecision::Denied(reason) => {
+            warn!("session request denied: {}", reason);
+            reporter
+                .logf(format!(
+                    "⚠ FUCINA_SESSION request DENIED: {} — running headless \
+                     (no keychain signing, no login keychain)",
                     reason
                 ))
                 .await;
-            None
+            session_kind(run_as)
         }
-        SessionDecision::Headless => None,
+        SessionDecision::Headless => session_kind(run_as),
     };
-    let session = if gui_uid.is_some() {
-        "gui"
-    } else {
-        session_kind(run_as)
-    };
+    let session_uid = decision.asuser_uid();
     info!(
-        "job context: run_as={} session={} (steps {} reach the login keychain)",
+        "job context: run_as={} session={} ({})",
         run_as.unwrap_or("<daemon user>"),
         session,
-        if session == "gui" { "can" } else { "CANNOT" }
+        match session {
+            "gui" => "steps can reach the login keychain",
+            "background" =>
+                "steps have their own security session: signing works, \
+                             the login keychain does not",
+            _ => "steps CANNOT use keychains or reach the login keychain",
+        }
     );
     merged_env.insert("FUCINA_SESSION".to_string(), session.to_string());
     ctx.set("env", env_to_json(&merged_env));
@@ -319,10 +348,10 @@ pub async fn execute(
                 // silently — each archive can burn one of the team's capped
                 // certificate slots behind a green checkmark. Warn while it's
                 // still one log line, not a portal cleanup.
-                if gui_uid.is_some() && invokes_automatic_signing(&rendered) {
+                if session_uid.is_some() && invokes_automatic_signing(&rendered) {
                     reporter
                         .log(
-                            "⚠ automatic signing inside a GUI session: this step can MINT \
+                            "⚠ automatic signing inside a granted session: this step can MINT \
                              certificates and silently burn cert slots — prefer \
                              CODE_SIGN_STYLE=Manual with an explicit profile \
                              (docs/execution-context.md)",
@@ -337,7 +366,7 @@ pub async fn execute(
                     &step_env,
                     &user_keys,
                     run_as,
-                    gui_uid,
+                    session_uid,
                     &reporter,
                     &mut shutdown,
                     deadline,
@@ -604,6 +633,34 @@ fn parse_string_map(val: Option<&serde_yaml::Value>) -> HashMap<String, String> 
     map
 }
 
+/// What a job asked for in `FUCINA_SESSION`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SessionRequest {
+    /// Unset, empty or `headless` — the hardened default.
+    None,
+    /// `gui`: the console user's Aqua session (login keychain, TCC, agents).
+    Gui,
+    /// `background`: a security session of the run_as user's own — keychains
+    /// and code signing work, with no Aqua session and no console user.
+    Background,
+}
+
+impl SessionRequest {
+    /// Parse the env value. An unknown value is surfaced, not ignored: a typo
+    /// like `FUCINA_SESSION: backgorund` must not silently run headless.
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.map(str::trim) {
+            None | Some("") => Ok(Self::None),
+            Some(v) if v.eq_ignore_ascii_case("headless") => Ok(Self::None),
+            Some(v) if v.eq_ignore_ascii_case("gui") => Ok(Self::Gui),
+            Some(v) if v.eq_ignore_ascii_case("background") => Ok(Self::Background),
+            Some(v) => Err(format!(
+                "unknown FUCINA_SESSION value '{v}' (expected gui, background or headless)"
+            )),
+        }
+    }
+}
+
 /// Outcome of a job's session-mode negotiation.
 #[derive(Debug, PartialEq)]
 enum SessionDecision {
@@ -612,40 +669,108 @@ enum SessionDecision {
     /// Granted: wrap steps in `launchctl asuser <uid>` to join the console
     /// user's Aqua session.
     Gui(u32),
+    /// Granted: wrap steps in `launchctl asuser <uid>` with the run_as user's
+    /// own uid, which lands in that user's Background session.
+    Background(u32),
     /// Requested but refused, with the reason to surface in the job log.
     Denied(String),
 }
 
-/// Decide whether a job gets the GUI session it asked for. Pure so it's
-/// testable; the inputs come from the merged env, the runner config, and
-/// `/dev/console`.
+impl SessionDecision {
+    /// The uid to `launchctl asuser` into, if any.
+    fn asuser_uid(&self) -> Option<u32> {
+        match self {
+            Self::Gui(uid) | Self::Background(uid) => Some(*uid),
+            _ => None,
+        }
+    }
+}
+
+/// Decide which session a job's steps get. Pure so it's testable; the inputs
+/// come from the merged env, the runner config, `/dev/console` and the
+/// passwd entry of `run_as`.
+///
+/// Why `background` exists: steps launched by the root daemon through `sudo`
+/// inherit the daemon's *System* bootstrap, where the run_as user has no
+/// security session. Keychain reads half-work, but legacy trust evaluation and
+/// private-key use fail — `codesign` dies with "unable to build chain to
+/// self-signed root" + `errSecInternalComponent` even with a fully prepared
+/// ephemeral keychain. `launchctl asuser <run_as uid>` instead attaches the
+/// step to that user's per-user launchd domain, whose session `launchctl
+/// managername` reports as `Background`, and signing works. A/B proven on
+/// giorno, 2026-10-15, in a root job in launchd's system domain: plain sudo
+/// gave 1 valid identity and a failed codesign; asuser gave 4 and a signed
+/// binary.
 fn decide_session(
-    requested: bool,
-    allowed: bool,
+    requested: SessionRequest,
+    allow_gui: bool,
     run_as: Option<&str>,
+    run_as_uid: Option<u32>,
     console: Option<(&str, u32)>,
 ) -> SessionDecision {
-    if !requested {
-        return SessionDecision::Headless;
+    match requested {
+        SessionRequest::None => SessionDecision::Headless,
+        SessionRequest::Gui => {
+            if !allow_gui {
+                return SessionDecision::Denied(
+                    "runner config has allow_gui_session: false".to_string(),
+                );
+            }
+            let Some(user) = run_as else {
+                return SessionDecision::Denied(
+                    "gui session requires run_as in the runner config — the daemon user has \
+                     no Aqua session"
+                        .to_string(),
+                );
+            };
+            match console {
+                Some((console_user, uid)) if console_user == user => SessionDecision::Gui(uid),
+                Some((console_user, _)) => SessionDecision::Denied(format!(
+                    "console user is '{}' but run_as is '{}' — no matching GUI session",
+                    console_user, user
+                )),
+                None => SessionDecision::Denied("no user logged in at the console".to_string()),
+            }
+        }
+        SessionRequest::Background => {
+            let Some(user) = run_as else {
+                return SessionDecision::Denied(
+                    "background session requires run_as in the runner config — it is the \
+                     run_as user's own session that steps join"
+                        .to_string(),
+                );
+            };
+            let Some(uid) = run_as_uid else {
+                return SessionDecision::Denied(format!(
+                    "could not resolve the uid of run_as user '{user}'"
+                ));
+            };
+            // For the user logged in at the console, `asuser` lands in Aqua,
+            // not Background (verified on speedwagon). A background request
+            // for that user IS a GUI request, so it answers to the same gate
+            // rather than becoming a way around allow_gui_session.
+            if console.is_some_and(|(_, console_uid)| console_uid == uid) {
+                return if allow_gui {
+                    SessionDecision::Gui(uid)
+                } else {
+                    SessionDecision::Denied(format!(
+                        "run_as '{user}' is the console user, so its session is the GUI session, \
+                         and the runner config has allow_gui_session: false"
+                    ))
+                };
+            }
+            SessionDecision::Background(uid)
+        }
     }
-    if !allowed {
-        return SessionDecision::Denied("runner config has allow_gui_session: false".to_string());
+}
+
+/// uid of a local user, from the passwd database.
+async fn user_uid(user: &str) -> Option<u32> {
+    let out = Command::new("id").args(["-u", user]).output().await.ok()?;
+    if !out.status.success() {
+        return None;
     }
-    let Some(user) = run_as else {
-        return SessionDecision::Denied(
-            "gui session requires run_as in the runner config — the daemon user has no \
-             Aqua session"
-                .to_string(),
-        );
-    };
-    match console {
-        Some((console_user, uid)) if console_user == user => SessionDecision::Gui(uid),
-        Some((console_user, _)) => SessionDecision::Denied(format!(
-            "console user is '{}' but run_as is '{}' — no matching GUI session",
-            console_user, user
-        )),
-        None => SessionDecision::Denied("no user logged in at the console".to_string()),
-    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// Who owns the console (GUI login), if anyone: `(username, uid)`.
@@ -1035,7 +1160,7 @@ async fn execute_run_step(
     env: &HashMap<String, String>,
     user_keys: &HashSet<String>,
     run_as: Option<&str>,
-    gui_uid: Option<u32>,
+    session_uid: Option<u32>,
     reporter: &Reporter,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     deadline: tokio::time::Instant,
@@ -1069,16 +1194,17 @@ async fn execute_run_step(
     // Build the command, wrapping in `sudo -u <user> -H -E` when run_as is set.
     // -H sets HOME to target user's home; -E preserves the parent env (PATH, etc.).
     //
-    // With a granted GUI session (`gui_uid`), prefix `launchctl asuser <uid>`:
-    // launchd adopts the console user's Mach bootstrap and security session
-    // before sudo drops privilege, so the step sees the real Aqua session —
-    // login keychain, ssh-agent, TCC — exactly as if typed in Terminal. Only
-    // root can call asuser; the daemon is root, and the LaunchAgent mode that
-    // isn't never gets a gui_uid (its steps are already in-session).
+    // With a granted session (`session_uid`), prefix `launchctl asuser <uid>`:
+    // launchd adopts that user's Mach bootstrap and security session before
+    // sudo drops privilege. For the console user that is the real Aqua session
+    // (login keychain, ssh-agent, TCC) exactly as if typed in Terminal; for
+    // any other user it is their Background session, where keychains and code
+    // signing work. Only root can call asuser; the daemon is root, and the
+    // LaunchAgent mode that isn't never gets a session_uid.
     let mut cmd = match run_as {
         Some(user) => {
             let mut c;
-            if let Some(uid) = gui_uid {
+            if let Some(uid) = session_uid {
                 c = Command::new("launchctl");
                 c.args(["asuser", &uid.to_string(), "sudo"]);
             } else {
@@ -2051,10 +2177,18 @@ outputs:
 
     // --- decide_session ---
 
+    use SessionRequest as Req;
+
     #[test]
     fn session_not_requested_is_headless() {
         assert_eq!(
-            decide_session(false, true, Some("cali"), Some(("cali", 501))),
+            decide_session(
+                Req::None,
+                true,
+                Some("cali"),
+                Some(501),
+                Some(("cali", 501))
+            ),
             SessionDecision::Headless
         );
     }
@@ -2062,7 +2196,7 @@ outputs:
     #[test]
     fn session_granted_when_console_matches_run_as() {
         assert_eq!(
-            decide_session(true, true, Some("cali"), Some(("cali", 501))),
+            decide_session(Req::Gui, true, Some("cali"), None, Some(("cali", 501))),
             SessionDecision::Gui(501)
         );
     }
@@ -2070,7 +2204,7 @@ outputs:
     #[test]
     fn session_denied_by_runner_config() {
         // the per-runner gate wins over everything
-        match decide_session(true, false, Some("cali"), Some(("cali", 501))) {
+        match decide_session(Req::Gui, false, Some("cali"), None, Some(("cali", 501))) {
             SessionDecision::Denied(r) => assert!(r.contains("allow_gui_session")),
             other => panic!("expected Denied, got {:?}", other),
         }
@@ -2078,7 +2212,7 @@ outputs:
 
     #[test]
     fn session_denied_without_run_as() {
-        match decide_session(true, true, None, Some(("cali", 501))) {
+        match decide_session(Req::Gui, true, None, None, Some(("cali", 501))) {
             SessionDecision::Denied(r) => assert!(r.contains("run_as")),
             other => panic!("expected Denied, got {:?}", other),
         }
@@ -2087,8 +2221,8 @@ outputs:
     #[test]
     fn session_denied_on_console_mismatch() {
         // giorno shape: steps run as ci, console belongs to cali — the ci
-        // user has no session to join.
-        match decide_session(true, true, Some("ci"), Some(("cali", 501))) {
+        // user has no GUI session to join.
+        match decide_session(Req::Gui, true, Some("ci"), None, Some(("cali", 501))) {
             SessionDecision::Denied(r) => assert!(r.contains("console user")),
             other => panic!("expected Denied, got {:?}", other),
         }
@@ -2096,10 +2230,95 @@ outputs:
 
     #[test]
     fn session_denied_when_nobody_logged_in() {
-        match decide_session(true, true, Some("cali"), None) {
+        match decide_session(Req::Gui, true, Some("cali"), None, None) {
             SessionDecision::Denied(r) => assert!(r.contains("logged in")),
             other => panic!("expected Denied, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn background_granted_for_a_service_user_without_any_gui_permission() {
+        // The giorno case this mode exists for: run_as ci, cali at the
+        // console, allow_gui_session false — and still a signing session.
+        assert_eq!(
+            decide_session(
+                Req::Background,
+                false,
+                Some("ci"),
+                Some(600),
+                Some(("cali", 501))
+            ),
+            SessionDecision::Background(600)
+        );
+        // Nobody at the console changes nothing for a service user.
+        assert_eq!(
+            decide_session(Req::Background, false, Some("ci"), Some(600), None),
+            SessionDecision::Background(600)
+        );
+    }
+
+    #[test]
+    fn background_for_the_console_user_is_a_gui_request() {
+        // asuser <console uid> lands in Aqua, so this must answer to the same
+        // gate as `gui` instead of becoming a way around it.
+        match decide_session(
+            Req::Background,
+            false,
+            Some("cali"),
+            Some(501),
+            Some(("cali", 501)),
+        ) {
+            SessionDecision::Denied(r) => {
+                assert!(r.contains("console user") && r.contains("allow_gui_session"))
+            }
+            other => panic!("expected Denied, got {:?}", other),
+        }
+        assert_eq!(
+            decide_session(
+                Req::Background,
+                true,
+                Some("cali"),
+                Some(501),
+                Some(("cali", 501))
+            ),
+            SessionDecision::Gui(501)
+        );
+    }
+
+    #[test]
+    fn background_needs_run_as_and_a_resolvable_uid() {
+        match decide_session(Req::Background, true, None, None, None) {
+            SessionDecision::Denied(r) => assert!(r.contains("run_as")),
+            other => panic!("expected Denied, got {:?}", other),
+        }
+        match decide_session(Req::Background, true, Some("ghost"), None, None) {
+            SessionDecision::Denied(r) => assert!(r.contains("uid") && r.contains("ghost")),
+            other => panic!("expected Denied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn only_granted_sessions_wrap_steps_in_asuser() {
+        assert_eq!(SessionDecision::Gui(501).asuser_uid(), Some(501));
+        assert_eq!(SessionDecision::Background(600).asuser_uid(), Some(600));
+        assert_eq!(SessionDecision::Headless.asuser_uid(), None);
+        assert_eq!(SessionDecision::Denied("x".into()).asuser_uid(), None);
+    }
+
+    #[test]
+    fn session_request_parsing() {
+        assert_eq!(SessionRequest::parse(None), Ok(Req::None));
+        // sigillo renders `''` when it doesn't want a session
+        assert_eq!(SessionRequest::parse(Some("")), Ok(Req::None));
+        assert_eq!(SessionRequest::parse(Some("headless")), Ok(Req::None));
+        assert_eq!(SessionRequest::parse(Some("GUI")), Ok(Req::Gui));
+        assert_eq!(
+            SessionRequest::parse(Some(" background ")),
+            Ok(Req::Background)
+        );
+        // a typo must be reported, never silently treated as headless
+        let err = SessionRequest::parse(Some("backgorund")).unwrap_err();
+        assert!(err.contains("backgorund"));
     }
 
     // --- session_kind ---

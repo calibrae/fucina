@@ -27,12 +27,13 @@ session and no login keychain.
 fucina logs it at the start of every job:
 
 ```
-job context: run_as=cali session=headless (steps CANNOT reach the login keychain)
+job context: run_as=ci session=headless (steps CANNOT use keychains or reach the login keychain)
+job context: run_as=ci session=background (steps have their own security session: signing works, the login keychain does not)
 ```
 
 and exports it to the steps:
 
-- `FUCINA_SESSION` — `gui` or `headless`
+- `FUCINA_SESSION` — `gui`, `background` or `headless` (the granted session, never the request)
 - `FUCINA_RUN_AS` — the user steps are dropped to (absent when steps run as the daemon user)
 
 So a build script can branch instead of failing:
@@ -60,12 +61,18 @@ attaches the audit session without injecting the env var — so its absence prov
 `FUCINA_SESSION` (runner-provided, granted reality) and the write-probe are the reliable
 tells.
 
-## Signing from a job (the pattern that always works)
+## Signing from a job: a throwaway keychain, inside a session
 
 Do not depend on the login keychain in CI, even where it happens to work — it only works while
 someone stays logged in, and it breaks on the next headless reboot. Build a throwaway keychain
-per job instead. `set-key-partition-list` is the step that actually makes the key usable
-without a UI prompt; without it the import succeeds and the signing still fails.
+per job instead, **and request `FUCINA_SESSION: background`** (next section) so the steps have
+a security session to use it in. `set-key-partition-list` is the step that actually makes the
+key usable without a UI prompt; without it the import succeeds and the signing still fails.
+
+```yaml
+env:
+  FUCINA_SESSION: background
+```
 
 ```bash
 KC="$RUNNER_TEMP/build.keychain-db"
@@ -77,6 +84,14 @@ security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed
 security import cert.p12 -P "$P12PW" -A -t cert -f pkcs12 -k "$KC" -T /usr/bin/codesign
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC"
 ```
+
+**Without a session this recipe does not work**, contrary to what this page said until
+v0.5.7. Every command above succeeds in the headless context — and then trust evaluation and
+private-key use fail: `find-identity -v` drops WWDR-issued identities as not trusted, and
+`codesign` dies with `unable to build chain to self-signed root` + `errSecInternalComponent`.
+sigillo hit it on every runner (2026-10-15). fucina's own `release.yml` uses the same recipe
+but runs on GitHub-hosted runners, a different execution context — it proves nothing about a
+fucina daemon.
 
 Certs live in vault (`secret/infra/apple-cert-*`); the App Store Connect API key
 (`secret/infra/apple-asc`) covers notarization and TestFlight upload without a keychain or 2FA.
@@ -93,7 +108,44 @@ Two traps that follow:
   `~/Library/MobileDevice/Provisioning Profiles/`, so an old same-named file silently wins.
   Purge before installing the current pair.
 
-## If a job genuinely needs the session: `FUCINA_SESSION: gui` (v0.5.0)
+## A security session without the GUI: `FUCINA_SESSION: background` (v0.5.7)
+
+```yaml
+# workflow- or job-level env
+env:
+  FUCINA_SESSION: background
+```
+
+When granted, steps run under `launchctl asuser <run_as uid> sudo -u <run_as> …`. For any user
+who is not at the console, that attaches the step to the user's own per-user launchd domain —
+`launchctl managername` reports it as **Background** — instead of the daemon's **System**
+bootstrap. That is enough for keychains: ephemeral keychains get legacy trust and private-key
+use back, and code signing works. No Aqua session, no console user, no login keychain.
+
+The A/B that settled it (giorno, 2026-10-15, run from a root job in launchd's system domain
+so the context is exactly the daemon's, with the same ephemeral keychain and identities):
+
+| step launched as | `managername` | valid codesigning identities | `codesign` (Apple Distribution) |
+|---|---|---|---|
+| `sudo -u ci` (headless) | System | 1 | `errSecInternalComponent` |
+| `launchctl asuser 600 sudo -u ci` | Background | 4 | signed |
+
+Conditions, each refused loudly in the job log:
+
+1. The runner has a **`run_as`** user — it is that user's session steps join.
+2. **No `allow_gui_session` needed**: the session belongs to the run_as user, the same user
+   the steps already run as, so it grants nothing across a security boundary. A repo can ask
+   for it on any runner; this is what lets giorno (`run_as: ci`, gui disallowed) sign.
+3. **Except for the console user.** `asuser` with the uid of the user logged in at the console
+   lands in their **Aqua** session, not Background. So a `background` request for that user
+   *is* a GUI request: granted as `gui` when `allow_gui_session: true`, refused otherwise —
+   never a way around the gate.
+
+Calling `SessionCreate` from inside a step does **not** do this: by then the step is already
+the unprivileged run_as user inside the System bootstrap, and a new audit session there has no
+per-user agents behind it. The switch has to happen in the root daemon, before `sudo`.
+
+## If a job genuinely needs the login session: `FUCINA_SESSION: gui` (v0.5.0)
 
 Some workloads cannot be untangled from the login session — Xcode automatic signing,
 fastlane lanes without `setup_ci`, anything TCC-gated. For those, a job can opt in:
@@ -122,9 +174,10 @@ request: a denied job sees `FUCINA_SESSION=headless` plus a `⚠ … DENIED: <re
 its log, so it can fall back to the throwaway keychain instead of failing mysteriously.
 
 Reach for this deliberately. A gui-session job can read everything the console user can —
-it is precisely the ambient exposure the daemon default removes. The throwaway keychain
-remains the better answer for plain codesign/notarize flows: it needs nobody logged in and
-works identically on every runner. The session hatch is for the flows that genuinely cannot.
+it is precisely the ambient exposure the daemon default removes. For plain codesign/notarize
+flows a throwaway keychain under `FUCINA_SESSION: background` is the better answer: it needs
+nobody logged in and works on every runner. The gui hatch is for the flows that genuinely
+cannot leave the login session.
 
 ## Step process trees (v0.5.5+)
 
