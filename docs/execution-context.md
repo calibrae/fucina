@@ -28,7 +28,7 @@ fucina logs it at the start of every job:
 
 ```
 job context: run_as=ci session=headless (steps CANNOT use keychains or reach the login keychain)
-job context: run_as=ci session=background (steps have their own security session: signing works, the login keychain does not)
+job context: run_as=ci session=background (steps have their own security session, not the login keychain)
 ```
 
 and exports it to the steps:
@@ -119,16 +119,24 @@ env:
 When granted, steps run under `launchctl asuser <run_as uid> sudo -u <run_as> …`. For any user
 who is not at the console, that attaches the step to the user's own per-user launchd domain —
 `launchctl managername` reports it as **Background** — instead of the daemon's **System**
-bootstrap. That is enough for keychains: ephemeral keychains get legacy trust and private-key
-use back, and code signing works. No Aqua session, no console user, no login keychain.
+bootstrap. No Aqua session, no console user, no login keychain.
 
-The A/B that settled it (giorno, 2026-10-15, run from a root job in launchd's system domain
-so the context is exactly the daemon's, with the same ephemeral keychain and identities):
+**Status — measured, not promised** (giorno, 2026-10-15; vault Apple Distribution identity in
+an ephemeral keychain with WWDR G3 + Apple Root CA):
 
-| step launched as | `managername` | valid codesigning identities | `codesign` (Apple Distribution) |
-|---|---|---|---|
-| `sudo -u ci` (headless) | System | 1 | `errSecInternalComponent` |
-| `launchctl asuser 600 sudo -u ci` | Background | 4 | signed |
+| step launched as | `managername` | `codesign` (Apple Distribution) |
+|---|---|---|
+| `sudo -u ci` (headless) | System | failed 3/3 — `errSecInternalComponent` |
+| `launchctl asuser 600 sudo -u ci` | Background | signed in 8 of 10 runs (7/8 in a root launchd harness, 1/2 for sigillo through fucina) |
+
+So the session is **necessary** for keychain signing, but not yet shown to be **sufficient**.
+The failures came in one window of roughly 25 minutes, where the same recipe and the same
+preferences, with no concurrent job, failed in every variant. Then it cleared by itself.
+Leading suspect: cached state in the user's long-running `trustd`/`secd` agents. Ruled out:
+the recipe (sigillo's and mine both pass outside the window), a concurrent job, and a default
+keychain pointing at a just-deleted file (reproduced deliberately; signing still passed). Until that is
+understood, keep a release that must sign on a path known to work (`FUCINA_SESSION: gui` on
+speedwagon), with `background` as the direction rather than the answer.
 
 Conditions, each refused loudly in the job log:
 
@@ -175,9 +183,9 @@ its log, so it can fall back to the throwaway keychain instead of failing myster
 
 Reach for this deliberately. A gui-session job can read everything the console user can —
 it is precisely the ambient exposure the daemon default removes. For plain codesign/notarize
-flows a throwaway keychain under `FUCINA_SESSION: background` is the better answer: it needs
-nobody logged in and works on every runner. The gui hatch is for the flows that genuinely
-cannot leave the login session.
+flows a throwaway keychain under `FUCINA_SESSION: background` is meant to be the better answer —
+nobody logged in, any runner — once its intermittent failure is explained. The gui hatch is
+for the flows that genuinely cannot leave the login session.
 
 ## Step process trees (v0.5.5+)
 

@@ -168,9 +168,10 @@ pub async fn execute(
     // can't sign (legacy trust and private-key use fail). A job opts in with
     // `FUCINA_SESSION` in its workflow- or job-level env:
     //   - `background`: steps join the run_as user's OWN session via
-    //     `launchctl asuser <run_as uid>`. Keychains and code signing work;
-    //     no Aqua, no console user, no config gate needed — it never leaves
-    //     the run_as user's security boundary (see decide_session).
+    //     `launchctl asuser <run_as uid>`. Necessary for keychain signing,
+    //     and measured to sign most of the time (see decide_session); no
+    //     Aqua, no console user, no config gate needed — it never leaves the
+    //     run_as user's security boundary.
     //   - `gui`: steps join the console user's Aqua session (login keychain,
     //     TCC, ssh-agent). Needs allow_gui_session and console user == run_as.
     // Whatever happens, the FUCINA_SESSION exported to steps states the
@@ -214,7 +215,7 @@ pub async fn execute(
             reporter
                 .logf(format!(
                     "Background session granted — steps run in {}'s own security session \
-                     (uid {}): keychains and code signing work, no GUI",
+                     (uid {}), no GUI",
                     run_as.unwrap_or("?"),
                     uid
                 ))
@@ -241,9 +242,7 @@ pub async fn execute(
         session,
         match session {
             "gui" => "steps can reach the login keychain",
-            "background" =>
-                "steps have their own security session: signing works, \
-                             the login keychain does not",
+            "background" => "steps have their own security session, not the login keychain",
             _ => "steps CANNOT use keychains or reach the login keychain",
         }
     );
@@ -640,8 +639,8 @@ enum SessionRequest {
     None,
     /// `gui`: the console user's Aqua session (login keychain, TCC, agents).
     Gui,
-    /// `background`: a security session of the run_as user's own — keychains
-    /// and code signing work, with no Aqua session and no console user.
+    /// `background`: a security session of the run_as user's own, with no
+    /// Aqua session and no console user.
     Background,
 }
 
@@ -697,10 +696,11 @@ impl SessionDecision {
 /// self-signed root" + `errSecInternalComponent` even with a fully prepared
 /// ephemeral keychain. `launchctl asuser <run_as uid>` instead attaches the
 /// step to that user's per-user launchd domain, whose session `launchctl
-/// managername` reports as `Background`, and signing works. A/B proven on
-/// giorno, 2026-10-15, in a root job in launchd's system domain: plain sudo
-/// gave 1 valid identity and a failed codesign; asuser gave 4 and a signed
-/// binary.
+/// managername` reports as `Background`. Measured on giorno, 2026-10-15, from
+/// a root job in launchd's system domain: plain sudo failed to codesign 3/3;
+/// asuser signed in 8 of 10 runs (7/8 harness, 1/2 sigillo via fucina) — necessary, but an intermittent failure
+/// window (same recipe, no concurrent job, cleared by itself) is still
+/// unexplained, so this is not yet a guarantee.
 fn decide_session(
     requested: SessionRequest,
     allow_gui: bool,
@@ -1198,8 +1198,9 @@ async fn execute_run_step(
     // launchd adopts that user's Mach bootstrap and security session before
     // sudo drops privilege. For the console user that is the real Aqua session
     // (login keychain, ssh-agent, TCC) exactly as if typed in Terminal; for
-    // any other user it is their Background session, where keychains and code
-    // signing work. Only root can call asuser; the daemon is root, and the
+    // any other user it is their Background session (see decide_session for
+    // what that does and doesn't guarantee for signing). Only root can call
+    // asuser; the daemon is root, and the
     // LaunchAgent mode that isn't never gets a session_uid.
     let mut cmd = match run_as {
         Some(user) => {
