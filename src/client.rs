@@ -153,3 +153,53 @@ impl ConnectClient {
         self.call("UpdateLog", &req).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RUSTSEC-2026-0382: eMudhra intermediate CA keys were recoverable, so
+    /// anyone could mint a certificate for any site under them. Fixed in
+    /// rustls-webpki 0.103.16 / webpki-roots 1.0.10. These hosts serve
+    /// certificates chained to the compromised intermediates; the runner's
+    /// real HTTP client must refuse them and still reach Gitea.
+    ///
+    /// Network-dependent, so ignored by default:
+    /// `cargo test -- --ignored emudhra`
+    #[tokio::test]
+    #[ignore]
+    async fn emudhra_chained_certificates_are_refused() {
+        let client = ConnectClient::new("https://git.calii.net").expect("client");
+        for host in [
+            "https://dv-g3b-emudhra.we-have-a-problem.com/",
+            "https://dv-g3b-aaa-emudhra.we-have-a-problem.com/",
+        ] {
+            let err = client
+                .http
+                .get(host)
+                .send()
+                .await
+                .expect_err(&format!("{host} must be refused"));
+            // Walk the source chain: "error sending request" alone could be
+            // DNS or a dropped socket. The refusal must come from cert checks.
+            let mut chain = String::new();
+            let mut src: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(e) = src {
+                chain.push_str(&format!(" -> {e}"));
+                src = e.source();
+            }
+            assert!(
+                chain.contains("certificate") || chain.contains("UnknownIssuer"),
+                "{host}: refused, but not by certificate validation:{chain}"
+            );
+            eprintln!("refused {host}:{chain}");
+        }
+        let ok = client
+            .http
+            .get("https://git.calii.net/api/healthz")
+            .send()
+            .await
+            .expect("git.calii.net must stay reachable");
+        eprintln!("git.calii.net: HTTP {}", ok.status());
+    }
+}
