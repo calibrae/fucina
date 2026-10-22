@@ -150,6 +150,7 @@ Gitea resolves the `needs` DAG server-side, but it does **not** decide a needs-b
 | `timeout` | `10800` | Job timeout in seconds (3h) |
 | `work_dir` | `/tmp/fucina` | Working directory for jobs |
 | `runner_file` | `.runner` | Path to credentials file |
+| `env` | `{}` | Env given to every job (e.g. `DOCKER_HOST`). Lowest precedence: workflow/job/step `env:` override it; never shadows `GITHUB_*`/`RUNNER_*`/`CI`/`FUCINA_*` |
 
 ## macOS Setup — use a LaunchDaemon, not a LaunchAgent
 

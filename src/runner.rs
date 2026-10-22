@@ -41,6 +41,7 @@ pub async fn execute(
     run_as: Option<&str>,
     allow_gui_session: bool,
     job_timeout: Duration,
+    runner_env: &HashMap<String, String>,
     task_state: Arc<crate::taskstate::TaskStateFile>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<proto::TaskResult> {
@@ -133,6 +134,7 @@ pub async fn execute(
     if let Some(user) = run_as {
         base_env.insert("FUCINA_RUN_AS".to_string(), user.to_string());
     }
+    apply_runner_env(&mut base_env, runner_env);
 
     // Job-level / workflow-level env blocks (Gap 3). Precedence is
     // workflow < job < step; we fold workflow then job into `merged_env`
@@ -158,8 +160,14 @@ pub async fn execute(
 
     // Keys explicitly defined by the workflow (vs. inherited daemon env).
     // Used to decide which vars to strip when running as another user.
-    let mut user_keys: HashSet<String> =
-        workflow_env.keys().chain(job_env.keys()).cloned().collect();
+    // Runner-config env counts as deliberate too: an operator who sets HOME
+    // there means it.
+    let mut user_keys: HashSet<String> = workflow_env
+        .keys()
+        .chain(job_env.keys())
+        .chain(runner_env.keys())
+        .cloned()
+        .collect();
 
     // --- Session mode -----------------------------------------------------
     // Default is headless: the daemon supervises, steps run via `sudo -u`
@@ -630,6 +638,16 @@ fn parse_string_map(val: Option<&serde_yaml::Value>) -> HashMap<String, String> 
         }
     }
     map
+}
+
+/// Fold the runner config's `env:` into a job's base env. Lowest precedence:
+/// workflow/job/step env are applied on top later, and a key the runner
+/// already derived (`GITHUB_*`, `RUNNER_*`, `CI`, `FUCINA_*`) is never
+/// replaced — host config must not be able to lie about the job itself.
+fn apply_runner_env(base: &mut HashMap<String, String>, runner_env: &HashMap<String, String>) {
+    for (k, v) in runner_env {
+        base.entry(k.clone()).or_insert_with(|| v.clone());
+    }
 }
 
 /// What a job asked for in `FUCINA_SESSION`.
@@ -2174,6 +2192,37 @@ outputs:
             "xcodebuild archive CODE_SIGN_STYLE=Manual PROVISIONING_PROFILE_SPECIFIER=x"
         ));
         assert!(!invokes_automatic_signing("cargo build --release"));
+    }
+
+    // --- apply_runner_env ---
+
+    #[test]
+    fn runner_env_fills_in_host_facts() {
+        let mut base = HashMap::from([("CI".to_string(), "true".to_string())]);
+        let runner = HashMap::from([(
+            "DOCKER_HOST".to_string(),
+            "unix:///Users/cali/.colima/default/docker.sock".to_string(),
+        )]);
+        apply_runner_env(&mut base, &runner);
+        assert_eq!(
+            base.get("DOCKER_HOST").map(String::as_str),
+            Some("unix:///Users/cali/.colima/default/docker.sock")
+        );
+    }
+
+    #[test]
+    fn runner_env_never_shadows_what_the_runner_derived() {
+        let mut base = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/work/ws".to_string()),
+            ("CI".to_string(), "true".to_string()),
+        ]);
+        let runner = HashMap::from([
+            ("GITHUB_WORKSPACE".to_string(), "/elsewhere".to_string()),
+            ("CI".to_string(), "false".to_string()),
+        ]);
+        apply_runner_env(&mut base, &runner);
+        assert_eq!(base["GITHUB_WORKSPACE"], "/work/ws");
+        assert_eq!(base["CI"], "true");
     }
 
     // --- decide_session ---

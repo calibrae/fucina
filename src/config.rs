@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,13 @@ pub struct Config {
     /// keep it off (the default) on runners that execute untrusted workflows.
     #[serde(default)]
     pub allow_gui_session: bool,
+    /// Environment given to every job on this runner — host facts a workflow
+    /// shouldn't have to know, e.g. `DOCKER_HOST` pointing at this machine's
+    /// container engine. Lowest precedence: workflow, job and step `env:`
+    /// override it, and it never shadows the runner's own `GITHUB_*` /
+    /// `RUNNER_*` / `CI` / `FUCINA_*` variables.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 fn default_name() -> String {
@@ -169,6 +177,23 @@ runner_file: /etc/runner/.runner
         assert_eq!(cfg.timeout, 7200);
         assert_eq!(cfg.labels.len(), 2);
         assert_eq!(cfg.work_dir, PathBuf::from("/var/lib/runner"));
+    }
+
+    #[test]
+    fn config_env_block() {
+        let yaml = r#"
+instance: https://git.calii.net
+env:
+  DOCKER_HOST: unix:///Users/cali/.colima/default/docker.sock
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.env.get("DOCKER_HOST").map(String::as_str),
+            Some("unix:///Users/cali/.colima/default/docker.sock")
+        );
+        // absent means empty, so existing configs keep working unchanged
+        let bare: Config = serde_yaml::from_str("instance: https://x\n").unwrap();
+        assert!(bare.env.is_empty());
     }
 
     #[test]

@@ -397,6 +397,11 @@ pub async fn run_daemon(
     }
 
     let mut poller = poller::Poller::new(client, &config, task_state);
+    if !config.env.is_empty() {
+        let mut keys: Vec<&String> = config.env.keys().collect();
+        keys.sort();
+        info!("runner env given to every job: {:?}", keys);
+    }
     if let Some(user) = &config.run_as {
         info!(
             "workflow steps will run as user '{}' via sudo (gui session opt-in: {})",

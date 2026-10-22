@@ -25,6 +25,8 @@ pub struct Poller {
     allow_gui_session: bool,
     /// Wall-clock ceiling for one job, from `timeout:` in the config.
     job_timeout: std::time::Duration,
+    /// `env:` from the config, given to every job.
+    runner_env: Arc<HashMap<String, String>>,
     tasks_version: i64,
     /// Tasks received while at capacity, awaiting a free worker slot.
     pending: VecDeque<Task>,
@@ -54,6 +56,7 @@ impl Poller {
             run_as: config.run_as.clone(),
             allow_gui_session: config.allow_gui_session,
             job_timeout: std::time::Duration::from_secs(config.timeout),
+            runner_env: Arc::new(config.env.clone()),
             tasks_version: 0,
             pending: VecDeque::new(),
             active: Arc::new(Mutex::new(HashSet::new())),
@@ -205,6 +208,7 @@ impl Poller {
         let run_as = self.run_as.clone();
         let allow_gui_session = self.allow_gui_session;
         let job_timeout = self.job_timeout;
+        let runner_env = self.runner_env.clone();
         let active = self.active.clone();
         let task_state = self.task_state.clone();
         let task_id = task.id;
@@ -223,6 +227,7 @@ impl Poller {
                 run_as.as_deref(),
                 allow_gui_session,
                 job_timeout,
+                &runner_env,
                 task_state.clone(),
                 shutdown,
             )
