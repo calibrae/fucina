@@ -181,7 +181,9 @@ fn env_matches<'a>(
 }
 
 /// Parse `ps -axE -ww -o pid=,command=` (macOS appends each process's
-/// environment to its command line) into the pids that match.
+/// environment to its command line) into the pids that match. Linux reads
+/// /proc instead, so this only exists where it is used.
+#[cfg(any(not(target_os = "linux"), test))]
 fn tagged_in_ps(ps_output: &str, task: Option<i64>, workspace_prefix: Option<&str>) -> Vec<i32> {
     ps_output
         .lines()
