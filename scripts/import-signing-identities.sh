@@ -15,8 +15,9 @@
 # and the secrets would share stdin.)
 #
 # Passwords never reach argv. Keychain commands go to `security -i` on stdin,
-# and sudo reads the password with -S. Keychain writes run inside cali's Aqua
-# session through `launchctl asuser`, which needs root, hence the sudo.
+# and sudo gets the password from an askpass helper reading a 600 file in a
+# 700 temp dir. Keychain writes run inside cali's Aqua session through
+# `launchctl asuser`, which needs root, hence the sudo.
 set -euo pipefail
 
 IFS= read -r PW || true
@@ -35,13 +36,21 @@ UID_CALI=$(id -u cali)
 KC="$HOME/Library/Keychains/login.keychain-db"
 W="$(mktemp -d "${TMPDIR:-/tmp}/fucina-import.XXXXXX")"
 chmod 700 "$W"
-cleanup() { rm -rf "$W"; sudo -k 2>/dev/null || true; }
+cleanup() { rm -rf "$W"; }
 trap cleanup EXIT
 
-# One sudo authentication for the whole run; the password goes in on stdin.
-printf '%s\n' "$PW" | sudo -S -p '' -v 2>/dev/null || die "sudo authentication failed"
-# Run a command as cali inside cali's Aqua session.
-in_aqua() { sudo -n /bin/launchctl asuser "$UID_CALI" sudo -n -u cali "$@"; }
+# sudo via an askpass helper, not a cached ticket. Without a tty, macOS sudo
+# keys its timestamp on the parent process, so a `sudo -v` ticket is invisible
+# to the sudo calls in $(...) and pipeline subshells (each has another parent):
+# the first run on trish failed its preflight exactly that way.
+(umask 077 && printf '%s\n' "$PW" >"$W/.p")
+printf '#!/bin/sh\ncat "%s/.p"\n' "$W" >"$W/ap"
+chmod 700 "$W/ap"
+export SUDO_ASKPASS="$W/ap"
+sudo -A -p '' true 2>/dev/null || die "sudo authentication failed"
+# Run a command as cali inside cali's Aqua session. The inner sudo runs as
+# root, so it never asks for a password.
+in_aqua() { sudo -A /bin/launchctl asuser "$UID_CALI" sudo -u cali "$@"; }
 # Keychain commands on stdin, never on argv. Exits non-zero if any command fails.
 sec_i() { in_aqua /usr/bin/security -i >/dev/null; }
 
