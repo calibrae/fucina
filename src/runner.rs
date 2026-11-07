@@ -379,6 +379,7 @@ pub async fn execute(
                     deadline,
                     &step_groups,
                     task_state.as_ref(),
+                    task.id,
                 )
                 .await
             } else if let Some(uses) = &step.uses {
@@ -491,6 +492,22 @@ pub async fn execute(
         reporter
             .logf(format!(
                 "Reclaimed {reclaimed} process group(s) still running at job end"
+            ))
+            .await;
+    }
+    // Then anything that escaped the step groups altogether — a server a
+    // test harness started with setsid or a detached spawn — found by the
+    // task tag every step process carries.
+    let escaped = crate::procgroup::reap_tagged(Some(task.id), None, Duration::from_secs(5)).await;
+    if escaped > 0 {
+        warn!(
+            "reclaimed {} process group(s) that escaped their step's group",
+            escaped
+        );
+        reporter
+            .logf(format!(
+                "Reclaimed {escaped} process group(s) that had left their step's process \
+                 group (setsid / detached spawn) — still running at job end"
             ))
             .await;
     }
@@ -1184,6 +1201,7 @@ async fn execute_run_step(
     deadline: tokio::time::Instant,
     step_groups: &Arc<Mutex<Vec<i32>>>,
     task_state: &crate::taskstate::TaskStateFile,
+    task_id: i64,
 ) -> Result<proto::TaskResult> {
     let shell = shell.unwrap_or("bash");
     let (shell_bin, shell_args) = match shell {
@@ -1256,6 +1274,10 @@ async fn execute_run_step(
             }
         }
     }
+
+    // Tag every step with its task. Set last so no workflow env can change
+    // it; inherited by anything the step starts, even in a new process group.
+    cmd.env(crate::procgroup::TASK_TAG, task_id.to_string());
 
     // Own process group per step: the pid fucina holds is `sudo`, never the
     // shell/mvn/JVM doing the work, so only a group signal reaches the tree.

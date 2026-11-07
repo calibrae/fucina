@@ -142,9 +142,179 @@ pub async fn reap_stale_groups(groups: &[i32], work_dir: &Path) {
     }
 }
 
+/// Env var set on every step process: the task id. Children inherit it
+/// through `setsid`, Node's `detached: true` spawns and reparenting to launchd
+/// — exactly the cases a process-group kill can't reach. Observed on
+/// speedwagon: a dg-gestion e2e server started via `pnpm … start` in its own
+/// process group outlived its cancelled task (4187) by a month, holding port
+/// 3990 and failing every later e2e run.
+pub const TASK_TAG: &str = "FUCINA_TASK_ID";
+
+/// Does one process environment (as `KEY=value` items) belong to us?
+/// `task: Some(id)` matches that task only; `None` matches any task, but then
+/// `workspace_prefix` must match too, so a startup sweep only ever claims
+/// processes from this runner's own work_dir.
+fn env_matches<'a>(
+    mut items: impl Iterator<Item = &'a str>,
+    task: Option<i64>,
+    workspace_prefix: Option<&str>,
+) -> bool {
+    let want = task.map(|id| format!("{TASK_TAG}={id}"));
+    let tag_prefix = format!("{TASK_TAG}=");
+    let (mut tag_ok, mut ws_ok) = (false, workspace_prefix.is_none());
+    for item in items.by_ref() {
+        match &want {
+            Some(w) if item == w => tag_ok = true,
+            None if item.starts_with(&tag_prefix) => tag_ok = true,
+            _ => {}
+        }
+        if let Some(prefix) = workspace_prefix {
+            if item
+                .strip_prefix("GITHUB_WORKSPACE=")
+                .is_some_and(|ws| ws.starts_with(prefix))
+            {
+                ws_ok = true;
+            }
+        }
+    }
+    tag_ok && ws_ok
+}
+
+/// Parse `ps -axE -ww -o pid=,command=` (macOS appends each process's
+/// environment to its command line) into the pids that match.
+fn tagged_in_ps(ps_output: &str, task: Option<i64>, workspace_prefix: Option<&str>) -> Vec<i32> {
+    ps_output
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.split_whitespace();
+            let pid: i32 = tokens.next()?.parse().ok()?;
+            env_matches(tokens, task, workspace_prefix).then_some(pid)
+        })
+        .collect()
+}
+
+/// Every pid currently carrying the tag (see `env_matches`).
+async fn list_tagged(task: Option<i64>, workspace_prefix: Option<&str>) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        if let Ok(dir) = std::fs::read_dir("/proc") {
+            for entry in dir.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+                    continue;
+                };
+                let Ok(raw) = std::fs::read(entry.path().join("environ")) else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&raw);
+                if env_matches(text.split('\0'), task, workspace_prefix) {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match tokio::process::Command::new("ps")
+            .args(["-axE", "-ww", "-o", "pid=,command="])
+            .output()
+            .await
+        {
+            Ok(o) => tagged_in_ps(&String::from_utf8_lossy(&o.stdout), task, workspace_prefix),
+            Err(e) => {
+                warn!("could not list processes to sweep tagged steps: {e}");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Reclaim every process still tagged for `task` (or, with `None`, any task
+/// whose workspace lies under `workspace_prefix`), together with the process
+/// group each one now leads or belongs to. Runs after the step-group kill, so
+/// it only finds what escaped it. Never touches fucina's own process or group.
+/// Returns how many groups or lone processes were signalled.
+pub async fn reap_tagged(
+    task: Option<i64>,
+    workspace_prefix: Option<&str>,
+    grace: Duration,
+) -> usize {
+    #[cfg(unix)]
+    {
+        let me = std::process::id() as i32;
+        // SAFETY: getpgid(0) / getpgid(pid) only read process metadata.
+        let my_pgid = unsafe { libc::getpgid(0) };
+        let mut groups: Vec<i32> = Vec::new();
+        let mut lone: Vec<i32> = Vec::new();
+        for pid in list_tagged(task, workspace_prefix).await {
+            if pid == me || pid <= 1 {
+                continue;
+            }
+            let pgid = unsafe { libc::getpgid(pid) };
+            if usable(pgid) && pgid != my_pgid {
+                if !groups.contains(&pgid) {
+                    groups.push(pgid);
+                }
+            } else if !lone.contains(&pid) {
+                lone.push(pid);
+            }
+        }
+        let mut signalled = 0;
+        for pgid in groups {
+            info!("reclaiming escaped process group {pgid} (tagged {TASK_TAG})");
+            if reap_group(pgid, grace).await {
+                signalled += 1;
+            }
+        }
+        for pid in lone {
+            // SAFETY: plain signal delivery to a pid we just found.
+            if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+                signalled += 1;
+                tokio::time::sleep(grace).await;
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        signalled
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (task, workspace_prefix, grace);
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_sweep_finds_the_task_even_after_setsid() {
+        // ps -axE appends the environment to the command line.
+        let ps = "\
+  101 /usr/sbin/cfprefsd agent
+58747 node /opt/homebrew/bin/pnpm --filter @dg/api start FUCINA_TASK_ID=4187 GITHUB_WORKSPACE=/Users/cali/gitea-runner-rs/work/task-4187/workspace
+58777 /opt/homebrew/bin/node src/index.ts FUCINA_TASK_ID=4187 GITHUB_WORKSPACE=/Users/cali/gitea-runner-rs/work/task-4187/workspace
+60001 node other.js FUCINA_TASK_ID=4188 GITHUB_WORKSPACE=/Users/cali/gitea-runner-rs/work/task-4188/workspace
+";
+        assert_eq!(tagged_in_ps(ps, Some(4187), None), vec![58747, 58777]);
+        // a task id that merely starts with ours is someone else's
+        assert!(tagged_in_ps("1 x FUCINA_TASK_ID=41870\n", Some(4187), None).is_empty());
+    }
+
+    #[test]
+    fn startup_sweep_only_claims_this_runners_work_dir() {
+        let ps = "\
+  700 node a.js FUCINA_TASK_ID=1 GITHUB_WORKSPACE=/Users/cali/gitea-runner-rs/work/task-1/workspace
+  701 node b.js FUCINA_TASK_ID=2 GITHUB_WORKSPACE=/Users/Shared/other-runner/task-2/workspace
+  702 node c.js GITHUB_WORKSPACE=/Users/cali/gitea-runner-rs/work/task-3/workspace
+";
+        // any task, but only under our work_dir, and only if tagged
+        assert_eq!(
+            tagged_in_ps(ps, None, Some("/Users/cali/gitea-runner-rs/work")),
+            vec![700]
+        );
+    }
 
     #[test]
     fn only_groups_touching_the_work_dir_are_reclaimable() {

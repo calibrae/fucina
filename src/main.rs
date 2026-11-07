@@ -370,6 +370,18 @@ pub async fn run_daemon(
     // whatever the last process left running before taking new work.
     let stale_groups = task_state.drain_stale_groups();
     procgroup::reap_stale_groups(&stale_groups, &config.work_dir).await;
+    // And anything from a previous run that escaped its step's group: no job
+    // of ours is running yet, so every tagged process under our work_dir is a
+    // leftover.
+    let escaped = procgroup::reap_tagged(
+        None,
+        Some(&config.work_dir.to_string_lossy()),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    if escaped > 0 {
+        warn!("reclaimed {escaped} tagged process group(s) left by a previous run");
+    }
 
     let stale_ids = task_state.drain_stale();
     if !stale_ids.is_empty() {
