@@ -48,16 +48,21 @@ if [ ! -f "$RUNNER_FILE" ]; then
   sudo -u "$CONSOLE_USER" /usr/bin/osascript -e \
     "display dialog \"Fucina installed. Edit the opened config.yaml with your Gitea URL, then run:\n\n  fucina --config $CONFIG register --token <TOKEN>\n\nThen launch Fucina.app.\" buttons {\"OK\"} default button 1 with title \"Fucina\"" || true
 else
-  # Credentials present — (re)launch the app.
-  #
-  # `open -a` only ACTIVATES an already-running instance, which left the
-  # previous version's binary running next to the freshly installed daemon
-  # after every upgrade (observed on giorno and speedwagon, 2026-09-14: apps
-  # from a 12-day-old release still up). Quit first so the new bundle is the
-  # one that runs. The daemon is a separate SMAppService job and is untouched.
+  # Credentials present. Always quit a running app so no previous version's
+  # binary is left behind: `open -a` only ACTIVATES an already-running
+  # instance, which left 12-day-old app binaries running next to a freshly
+  # installed daemon on giorno and speedwagon (2026-09-14).
   sudo -u "$CONSOLE_USER" /usr/bin/osascript -e 'quit app "Fucina"' >/dev/null 2>&1 || true
   sleep 2
-  sudo -u "$CONSOLE_USER" /usr/bin/open /Applications/Fucina.app || true
+  # Relaunch it only where it is the runner. With the SMAppService daemon
+  # registered, the daemon runs jobs and the app is merely a menu-bar
+  # controller nobody asked for: launching it on every upgrade only invited
+  # operators to kill it as a suspected second runner (trish, 2026-11-07).
+  if launchctl print system/net.calii.fucina.daemon >/dev/null 2>&1; then
+    echo "fucina: system daemon registered — not launching the menu-bar app"
+  else
+    sudo -u "$CONSOLE_USER" /usr/bin/open /Applications/Fucina.app || true
+  fi
 fi
 
 exit 0
